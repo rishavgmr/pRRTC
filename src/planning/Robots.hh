@@ -235,4 +235,46 @@ namespace ppln::robots {
             scale_cfg_impl(q);
         }
     };
+
+    struct Fanucm710{
+
+    static constexpr auto name = "fanucm710";
+    static constexpr std::size_t dimension = 7;
+    using Configuration = std::array<float, dimension>;
+
+    __device__ static constexpr float get_s_m(int i) {
+        constexpr float values[] = {
+            3.0, 6.2831854820251465, 3.9269907474517822, 6.457718372344971, 12.566370964050293, 4.363323211669922, 12.566370964050293
+        };
+        return values[i];
+    }
+    
+    __device__ static constexpr float get_s_a(int i) {
+        constexpr float values[] = {
+            0.0, -3.1415927410125732, -1.5707963705062866, -1.5707963705062866, -6.2831854820251465, -2.181661605834961, -6.2831854820251465
+        };
+        return values[i];
+    }
+    
+    template<size_t I = 0>
+    __device__ __forceinline__ static void scale_cfg_impl(float *q)
+    {
+        if constexpr (I < dimension) {
+            q[I] = q[I] * get_s_m(I) + get_s_a(I);
+            scale_cfg_impl<I + 1>(q);
+        }
+    }
+
+    __device__ __forceinline__ static void scale_cfg(float *q)
+    {
+        scale_cfg_impl(q);
+    }
+
+    inline static void print_robot_config(Configuration &cfg) {
+        for (int i = 0; i < dimension; i++) {
+            std::cout << cfg[i] << ' ';
+        }
+        std::cout << '\n';
+    };
+};
 }
