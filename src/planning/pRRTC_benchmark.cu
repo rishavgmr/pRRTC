@@ -16,10 +16,13 @@
 #include <vector>
 #include <iostream>
 #include <cassert>
+#include <stdexcept>
 #include <algorithm>
 #include <numeric>
 #include <random>
 #include <cmath>
+#include <array>
+#include <cstdint>
 
 /*
 Parallelized RRTC: Each block works to add a config to the tree (either start or goal depending on balance)
@@ -382,7 +385,7 @@ namespace pRRTC
         __shared__ float vec[dim];
         __shared__ unsigned int n_extensions;
         __shared__ bool should_skip;
-        __align__(16) __shared__ volatile float sphere_pos[6000];        // ~assuming max 120 spheres with granularity 32, each has x y z coordinates
+        __align__(16) __shared__ volatile float sphere_pos[8000];        // needs FANUCM710_SPHERE_COUNT(148) * BATCH_SIZE(16) * 3 = 7104 (RSW-2740 tool-sphere capacity expansion) - was 6000, sized for ~125 spheres at BATCH_SIZE 16, silently overflowed (illegal memory access) once fanucm710_spheres_array grew to 148
         __align__(16) __shared__ volatile float sphere_pos_approx[2500]; // ~assuming 50 spheres with granularity 32, each has x y z coordinates
         __align__(16) __shared__ volatile int link_CC[640];              // assuming max granularity 32, max number of links 20
         __align__(16) __shared__ float T[16 * 2 * 16];                   // 32 robots x 2x4x4 transform matrix
@@ -539,12 +542,33 @@ namespace pRRTC
 
             __syncthreads();
             // if collision found in approx env check, proceed to detailed env check
-            if (local_cc_result[0] == 1)
+            //
+            // RSW-2740: capture the escalation decision into a value every thread reads at the
+            // same point (right after the barrier above, before any writes happen), so it's
+            // provably uniform across all threads, then make the reset+sync unconditional -
+            // confirmed via compute-sanitizer --tool racecheck that the previous form (branch on
+            // local_cc_result[0], reset it from inside that same branch) let a fast thread's
+            // reset race ahead of a slow thread's own read of the same condition, so different
+            // threads could take different branches here even though the decision should be
+            // identical for all of them - skipping some threads out of the cooperative detailed
+            // FK/collision computation entirely, leaving their portion of sphere_pos stale
+            // (exactly the kind of corruption that would silently miss a real collision).
+            bool need_detailed_env_check = (local_cc_result[0] == 1);
+            // RSW-2740: a __syncthreads() right after a __syncthreads() looks redundant, but
+            // isn't - warps aren't lockstep after a barrier, so without this one a fast warp
+            // could race through the reset below before a slow warp has even executed the read
+            // above (confirmed via compute-sanitizer racecheck flagging exactly this gap as a
+            // WAR hazard even after the read was made value-uniform). This barrier guarantees
+            // every thread has captured its own copy before any thread is allowed to reset the
+            // shared flag.
+            __syncthreads();
+            if (tid == 0 && need_detailed_env_check)
             {
-                // if (tid == 0) printf("approx env collision\n");
-                if (tid == 0)
-                    local_cc_result[0] = 0;
-                __syncthreads();
+                local_cc_result[0] = 0;
+            }
+            __syncthreads();
+            if (need_detailed_env_check)
+            {
                 // reset_to_unwritten_state(sphere_pos, 4000, tid);
                 ppln::collision::fk<Robot>(interp_cfg, sphere_pos, T, tid);
                 detailed_FK = 1;
@@ -570,12 +594,22 @@ namespace pRRTC
                 atomicOr((unsigned int *)&local_cc_result[0], config_in_collision_approx ? 1u : 0u);
                 __syncthreads();
                 // if collision found in approx self check, proceed to detailed self check
-                if (local_cc_result[0] == 1)
+                //
+                // RSW-2740: same fix as the env-check site above - capture the escalation
+                // decision uniformly before any thread resets it, then gate the body on the
+                // captured value (see the detailed comment on the env-check site for why this
+                // matters).
+                bool need_detailed_self_check = (local_cc_result[0] == 1);
+                // RSW-2740: see the env-check site above for why this extra barrier (between
+                // capturing the decision and resetting the flag) is required, not redundant.
+                __syncthreads();
+                if (tid == 0 && need_detailed_self_check)
                 {
-                    // if (tid == 0) printf("approx self collision\n");
-                    if (tid == 0)
-                        local_cc_result[0] = 0;
-                    __syncthreads();
+                    local_cc_result[0] = 0;
+                }
+                __syncthreads();
+                if (need_detailed_self_check)
+                {
                     if (detailed_FK == 0)
                     {
                         // reset_to_unwritten_state(sphere_pos, 4000, tid);
@@ -716,12 +750,21 @@ namespace pRRTC
                     atomicOr((unsigned int *)&local_cc_result[0], config_in_collision2_approx ? 1u : 0u);
                     __syncthreads();
                     // if collision found in approx env check, proceed to detailed env check
-                    if (local_cc_result[0] == 1)
+                    //
+                    // RSW-2740: same fix as the earlier env-check site - capture the escalation
+                    // decision uniformly before any thread resets it, then gate the body on the
+                    // captured value.
+                    bool need_detailed_env_check2 = (local_cc_result[0] == 1);
+                    // RSW-2740: see the earlier env-check site for why this extra barrier
+                    // (between capturing the decision and resetting the flag) is required.
+                    __syncthreads();
+                    if (tid == 0 && need_detailed_env_check2)
                     {
-                        // if (tid == 0) printf("approx env collision in extension\n");
-                        if (tid == 0)
-                            local_cc_result[0] = 0;
-                        __syncthreads();
+                        local_cc_result[0] = 0;
+                    }
+                    __syncthreads();
+                    if (need_detailed_env_check2)
+                    {
                         // reset_to_unwritten_state(sphere_pos, 4000, tid);
                         ppln::collision::fk<Robot>(interp_cfg, sphere_pos, T, tid);
                         detailed_FK = 1;
@@ -746,12 +789,21 @@ namespace pRRTC
                         atomicOr((unsigned int *)&local_cc_result[0], config_in_collision_approx ? 1u : 0u);
                         __syncthreads();
                         // if collision found in approx self check, proceed to detailed self check
-                        if (local_cc_result[0] == 1)
+                        //
+                        // RSW-2740: same fix as the earlier self-check site - capture the
+                        // escalation decision uniformly before any thread resets it, then gate
+                        // the body on the captured value.
+                        bool need_detailed_self_check2 = (local_cc_result[0] == 1);
+                        // RSW-2740: see the earlier env-check site for why this extra barrier
+                        // (between capturing the decision and resetting the flag) is required.
+                        __syncthreads();
+                        if (tid == 0 && need_detailed_self_check2)
                         {
-                            // if (tid == 0) printf("approx self collision in extension\n");
-                            if (tid == 0)
-                                local_cc_result[0] = 0;
-                            __syncthreads();
+                            local_cc_result[0] = 0;
+                        }
+                        __syncthreads();
+                        if (need_detailed_self_check2)
+                        {
                             if (detailed_FK == 0)
                             {
                                 // reset_to_unwritten_state(sphere_pos, 4000, tid);
@@ -767,6 +819,15 @@ namespace pRRTC
                     }
 
                     bool ext_edge_good = local_cc_result[0] == 0;
+                    // RSW-2740: this barrier was already present at the equivalent "edge_good"
+                    // site above (rrtc()'s toward-random-sample EXTEND path) but missing here -
+                    // without it, tid 0 can race past its own (uniform, correctly-captured) read
+                    // into the reset write below (local_cc_result[0] = 0, guarded by tid==0 and
+                    // this very "good" verdict) before a slower thread's own read of the same
+                    // location has executed, an unsynchronized read/write pair on the same shared
+                    // location even though the value itself never actually changes (confirmed via
+                    // compute-sanitizer racecheck flagging exactly this gap as a WAR hazard).
+                    __syncthreads();
                     if (!ext_edge_good)
                         break;
                     if (tid == 0)
@@ -1052,9 +1113,17 @@ namespace pRRTC
     {
         static constexpr auto dim = Robot::dimension;
 
+        // RSW-2740: link_CC must be volatile, matching rrtc()'s own copy of this buffer (line
+        // ~390) - without it, nothing here forces the compiler to treat the approx-tier's
+        // atomicAdd writes (in fanucm710_env_collision_check_approx_sdf) as visible to the
+        // fine-tier's later gating read (in fanucm710_env_collision_check_sdf's "if
+        // (joint_in_collision[...] > 0)"), even across the intervening __syncthreads(). This was
+        // a real, reproducible bug (not a false positive): confirmed via direct isolated calls to
+        // check_edge_segment on a known-colliding edge (independently verified against the same
+        // SDF/FK model check_edge_segment itself uses) that it was consistently missing.
         __shared__ volatile unsigned int local_cc_result[1];
-        __shared__ int link_CC[640];
-        __align__(16) __shared__ volatile float sphere_pos[6000];
+        __shared__ volatile int link_CC[640];
+        __align__(16) __shared__ volatile float sphere_pos[8000];  // see rrtc()'s own copy of this buffer above for why 8000
         __align__(16) __shared__ volatile float sphere_pos_approx[2500];
         __align__(16) __shared__ float T[16 * 2 * 16];
 
@@ -1073,7 +1142,6 @@ namespace pRRTC
         {
             interp_cfg[i] = base[i] + (int(tid / 4 + 1) * delta[i]);
         }
-
         int detailed_FK = 0;
         ppln::collision::fk_approx<Robot>(interp_cfg, sphere_pos_approx, T, tid);
         __syncthreads();
@@ -1082,13 +1150,19 @@ namespace pRRTC
         atomicOr((unsigned int *)&local_cc_result[0], config_in_collision2_approx ? 1u : 0u);
         __syncthreads();
 
-        if (local_cc_result[0] == 1)
+        // RSW-2740: same fix as rrtc()'s env-check sites - capture the escalation decision
+        // uniformly before any thread resets it, then gate the body on the captured value.
+        bool need_detailed_env_check = (local_cc_result[0] == 1);
+        // RSW-2740: see rrtc()'s env-check sites for why this extra barrier (between capturing
+        // the decision and resetting the flag) is required, not redundant with the barrier below.
+        __syncthreads();
+        if (tid == 0 && need_detailed_env_check)
         {
-            if (tid == 0)
-            {
-                local_cc_result[0] = 0;
-            }
-            __syncthreads();
+            local_cc_result[0] = 0;
+        }
+        __syncthreads();
+        if (need_detailed_env_check)
+        {
             ppln::collision::fk<Robot>(interp_cfg, sphere_pos, T, tid);
             detailed_FK = 1;
             __syncthreads();
@@ -1110,13 +1184,19 @@ namespace pRRTC
             atomicOr((unsigned int *)&local_cc_result[0], config_in_collision_approx ? 1u : 0u);
             __syncthreads();
 
-            if (local_cc_result[0] == 1)
+            // RSW-2740: same fix as rrtc()'s self-check sites - capture the escalation decision
+            // uniformly before any thread resets it, then gate the body on the captured value.
+            bool need_detailed_self_check = (local_cc_result[0] == 1);
+            // RSW-2740: see rrtc()'s env-check sites for why this extra barrier (between
+            // capturing the decision and resetting the flag) is required, not redundant.
+            __syncthreads();
+            if (tid == 0 && need_detailed_self_check)
             {
-                if (tid == 0)
-                {
-                    local_cc_result[0] = 0;
-                }
-                __syncthreads();
+                local_cc_result[0] = 0;
+            }
+            __syncthreads();
+            if (need_detailed_self_check)
+            {
                 if (detailed_FK == 0)
                 {
                     ppln::collision::fk<Robot>(interp_cfg, sphere_pos, T, tid);
@@ -1263,6 +1343,10 @@ namespace pRRTC
             // centers).
             grid.spacing = (src.boundsUpper[0] - src.boundsLower[0]) / (float) src.numX;
             grid.offset_scaled = src.offset_scaled;
+            grid.inv_rotation_row0 = make_float3(src.inv_rotation[0][0], src.inv_rotation[0][1], src.inv_rotation[0][2]);
+            grid.inv_rotation_row1 = make_float3(src.inv_rotation[1][0], src.inv_rotation[1][1], src.inv_rotation[1][2]);
+            grid.inv_rotation_row2 = make_float3(src.inv_rotation[2][0], src.inv_rotation[2][1], src.inv_rotation[2][2]);
+            grid.inv_translation = make_float3(src.inv_translation[0], src.inv_translation[1], src.inv_translation[2]);
 
             h_grid_structs[g] = grid;
         }
@@ -1282,6 +1366,200 @@ namespace pRRTC
         cudaMemcpyToSymbol(ppln::collision::fanucm710_link_env_mask, h_mask, sizeof(h_mask));
 
         cudaMemcpyToSymbol(ppln::collision::fanucm710_self_collision_offset, &self_collision_offset_m, sizeof(float));
+    }
+
+    void uploadToolSpheres(
+        const std::vector<ToolSphereHost> &fine,
+        const std::vector<ToolSphereHost> &approx)
+    {
+        if (fine.size() > FANUCM710_MAX_TOOL_SPHERES)
+        {
+            throw std::runtime_error(
+                "uploadToolSpheres: fine tool sphere count exceeds FANUCM710_MAX_TOOL_SPHERES ("
+                + std::to_string(fine.size()) + " > " + std::to_string(FANUCM710_MAX_TOOL_SPHERES) + ")");
+        }
+        if (approx.size() > FANUCM710_APPROX_MAX_TOOL_SPHERES)
+        {
+            throw std::runtime_error(
+                "uploadToolSpheres: approx tool sphere count exceeds FANUCM710_APPROX_MAX_TOOL_SPHERES ("
+                + std::to_string(approx.size()) + " > " + std::to_string(FANUCM710_APPROX_MAX_TOOL_SPHERES) + ")");
+        }
+
+        // Same far-away, zero-radius placeholder fanuc_m710_benchmark.cuh's tool-sphere
+        // reservation already defaults to at compile time - see that file's own comment for why
+        // it can never register a collision under either the self- or env-collision formulas.
+        const float4 kInertPlaceholder = make_float4(1e6f, 1e6f, 1e6f, 0.0f);
+
+        std::vector<float4> fine_padded(FANUCM710_MAX_TOOL_SPHERES, kInertPlaceholder);
+        for (std::size_t i = 0; i < fine.size(); i++)
+        {
+            fine_padded[i] = make_float4(fine[i].x, fine[i].y, fine[i].z, fine[i].radius);
+        }
+        cudaMemcpyToSymbol(
+            ppln::collision::fanucm710_spheres_array,
+            fine_padded.data(),
+            sizeof(float4) * FANUCM710_MAX_TOOL_SPHERES,
+            sizeof(float4) * (FANUCM710_SPHERE_COUNT - FANUCM710_MAX_TOOL_SPHERES));
+
+        std::vector<float4> approx_padded(FANUCM710_APPROX_MAX_TOOL_SPHERES, kInertPlaceholder);
+        for (std::size_t i = 0; i < approx.size(); i++)
+        {
+            approx_padded[i] = make_float4(approx[i].x, approx[i].y, approx[i].z, approx[i].radius);
+        }
+        cudaMemcpyToSymbol(
+            ppln::collision::fanucm710_approx_spheres_array,
+            approx_padded.data(),
+            sizeof(float4) * FANUCM710_APPROX_MAX_TOOL_SPHERES,
+            sizeof(float4) * (FANUCM710_APPROX_SPHERE_COUNT - FANUCM710_APPROX_MAX_TOOL_SPHERES));
+    }
+
+    // Joint 2's fixed transform is the third 16-float (row-major 4x4) block in
+    // fanucm710_fixed_transforms/fanucm710_approx_fixed_transforms - see fanuc_m710_benchmark.cuh's
+    // own layout (joint 0, then joint 1, then joint 2).
+    constexpr std::size_t kJoint2FloatOffset = 2 * 16;
+
+    // Composes frames1_rotation onto one joint's canonical (currently-compiled) fixed transform
+    // block - see uploadRobotOverrides()'s header comment (pRRTC_benchmark.hh) for why joint 2
+    // specifically needs this.
+    void compose_frames1_onto_joint2(const float canonical[16], const Mat3Host &frames1_rotation, float out[16])
+    {
+        const float canonical_rotation[3][3] = {
+            { canonical[0], canonical[1], canonical[2] },
+            { canonical[4], canonical[5], canonical[6] },
+            { canonical[8], canonical[9], canonical[10] },
+        };
+        const float canonical_translation[3] = { canonical[3], canonical[7], canonical[11] };
+
+        for (int r = 0; r < 3; r++)
+        {
+            for (int c = 0; c < 3; c++)
+            {
+                float sum = 0.0f;
+                for (int k = 0; k < 3; k++)
+                {
+                    sum += frames1_rotation.m[r][k] * canonical_rotation[k][c];
+                }
+                out[r * 4 + c] = sum;
+            }
+            float t = 0.0f;
+            for (int k = 0; k < 3; k++)
+            {
+                t += frames1_rotation.m[r][k] * canonical_translation[k];
+            }
+            out[r * 4 + 3] = t;
+        }
+        out[12] = 0.0f;
+        out[13] = 0.0f;
+        out[14] = 0.0f;
+        out[15] = 1.0f;
+    }
+
+    void uploadRobotOverrides(
+        const std::vector<ToolSphereHost> &base_link_fine,
+        const std::vector<ToolSphereHost> &base_link_approx,
+        const Mat3Host &frames1_rotation)
+    {
+        // base_link occupies the first kBaseLinkFineCapacity/kBaseLinkApproxCapacity entries of
+        // fanucm710_spheres_array/fanucm710_approx_spheres_array - both are genuine reserved
+        // capacity now (RSW-2740), padded with the same inert placeholder tool spheres use for
+        // whatever's unused: fine tier's 24 matches Collins's own real count with no slack yet
+        // needed (e.g. pierce_primer's 22-sphere fine tier fits with 2 to spare); approx tier's
+        // 16 was bumped up from an original exact-4 (Collins's own count, zero slack) once
+        // pierce_primer's approx-tier base_link needed more than 4 for a visually-tuned fit - see
+        // fanuc_m710_benchmark.cuh's FANUCM710_APPROX_MAX_BASE_LINK_SPHERES, which this constant
+        // must stay in sync with by convention. Exceeding either capacity still throws rather
+        // than silently truncating (same stance as uploadToolSpheres()) - fine tier's would need
+        // the same kind of array-growth cricket did for tool spheres if it were ever undersized.
+        constexpr int kBaseLinkFineCapacity = 24;
+        constexpr int kBaseLinkApproxCapacity = 16;
+        if (base_link_fine.size() > kBaseLinkFineCapacity)
+        {
+            throw std::runtime_error(
+                "uploadRobotOverrides: base_link_fine has " + std::to_string(base_link_fine.size())
+                + " spheres, exceeds capacity " + std::to_string(kBaseLinkFineCapacity));
+        }
+        if (base_link_approx.size() > kBaseLinkApproxCapacity)
+        {
+            throw std::runtime_error(
+                "uploadRobotOverrides: base_link_approx has " + std::to_string(base_link_approx.size())
+                + " spheres, exceeds capacity " + std::to_string(kBaseLinkApproxCapacity));
+        }
+
+        const float4 kInertPlaceholder = make_float4(1e6f, 1e6f, 1e6f, 0.0f);
+
+        std::vector<float4> fine_spheres(kBaseLinkFineCapacity, kInertPlaceholder);
+        for (std::size_t i = 0; i < base_link_fine.size(); i++)
+        {
+            fine_spheres[i] = make_float4(
+                base_link_fine[i].x, base_link_fine[i].y, base_link_fine[i].z, base_link_fine[i].radius);
+        }
+        cudaMemcpyToSymbol(
+            ppln::collision::fanucm710_spheres_array, fine_spheres.data(), sizeof(float4) * kBaseLinkFineCapacity);
+
+        std::vector<float4> approx_spheres(kBaseLinkApproxCapacity, kInertPlaceholder);
+        for (std::size_t i = 0; i < base_link_approx.size(); i++)
+        {
+            approx_spheres[i] = make_float4(
+                base_link_approx[i].x, base_link_approx[i].y, base_link_approx[i].z, base_link_approx[i].radius);
+        }
+        cudaMemcpyToSymbol(
+            ppln::collision::fanucm710_approx_spheres_array, approx_spheres.data(),
+            sizeof(float4) * kBaseLinkApproxCapacity);
+
+        // RSW-2740: read the CANONICAL (un-rotated) joint2 block from the device symbol only
+        // once, on this function's first-ever call, and cache it here - NOT on every call, as
+        // the code used to. Composing frames1_rotation onto "whatever the symbol currently
+        // holds" is only correct the first time: every call after that would read back the
+        // PREVIOUS call's own rotated result (not the compile-time canonical value it looks
+        // like), compounding the rotation further each time (90 degrees -> 180 -> 270 -> ...).
+        // Confirmed via a device-side readback that this is exactly what was happening -
+        // solve()'s own cudaDeviceReset() (called between every run in the benchmark's run
+        // loop) does NOT reliably restore __constant__ memory to its compile-time initializer
+        // before this function's next cudaMemcpyFromSymbol call, so the symbol can't be trusted
+        // as "canonical" past the first call. Caching the true canonical value here instead
+        // sidesteps that entirely - this fix does not depend on understanding exactly why the
+        // reset doesn't restore it in time. This was the actual root cause of pierce_primer's
+        // (90-degree base rotation) runs after the first silently mis-posing the whole arm from
+        // joint 2 outward and missing real workpiece collisions as a result; collins (~0-degree
+        // base rotation) never showed the symptom because composing ~identity onto ~identity
+        // repeatedly is a no-op regardless of how many times it happens.
+        static float canonical_joint2_fine[16];
+        static float canonical_joint2_approx[16];
+        static bool canonical_captured = false;
+        if (!canonical_captured)
+        {
+            cudaMemcpyFromSymbol(
+                canonical_joint2_fine, ppln::collision::fanucm710_fixed_transforms, sizeof(float) * 16,
+                sizeof(float) * kJoint2FloatOffset);
+            cudaMemcpyFromSymbol(
+                canonical_joint2_approx, ppln::collision::fanucm710_approx_fixed_transforms, sizeof(float) * 16,
+                sizeof(float) * kJoint2FloatOffset);
+            canonical_captured = true;
+        }
+
+        float new_joint2_fine[16];
+        compose_frames1_onto_joint2(canonical_joint2_fine, frames1_rotation, new_joint2_fine);
+        cudaMemcpyToSymbol(
+            ppln::collision::fanucm710_fixed_transforms, new_joint2_fine, sizeof(float) * 16,
+            sizeof(float) * kJoint2FloatOffset);
+
+        float new_joint2_approx[16];
+        compose_frames1_onto_joint2(canonical_joint2_approx, frames1_rotation, new_joint2_approx);
+        cudaMemcpyToSymbol(
+            ppln::collision::fanucm710_approx_fixed_transforms, new_joint2_approx, sizeof(float) * 16,
+            sizeof(float) * kJoint2FloatOffset);
+    }
+
+    void uploadJointLimits(const std::array<float, 7> &lower, const std::array<float, 7> &upper)
+    {
+        float s_a[7], s_m[7];
+        for (int i = 0; i < 7; i++)
+        {
+            s_a[i] = lower[i];
+            s_m[i] = upper[i] - lower[i];
+        }
+        cudaMemcpyToSymbol(ppln::robots::fanucm710_dof_s_a, s_a, sizeof(s_a));
+        cudaMemcpyToSymbol(ppln::robots::fanucm710_dof_s_m, s_m, sizeof(s_m));
     }
 
     template <typename Robot>

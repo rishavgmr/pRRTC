@@ -36,6 +36,19 @@ struct SDFGrid {
     // system also pre-scales by *100.0 in updateCustomCollisionOffsets. 0 for a grid with no
     // required margin.
     float offset_scaled;
+    // World-to-local rigid transform (RSW-2740) - boundsLower/boundsUpper/the voxel data are all
+    // expressed in this object's own local frame (wherever its mesh was authored), but robot
+    // sphere positions are computed in world frame. inv_rotation_row{0,1,2}/inv_translation are
+    // the *inverse* of the object's world placement (scene_config's position/orientation),
+    // precomputed once on the host (see benchmark_fanuc_m710.cpp's load_sdf_environment()) -
+    // sdf_lookup() applies local = invR*world + invT as its very first step, mirroring
+    // CollisionManager's own `sphere_ball_transform = invTransform * sphere_ball_transform`
+    // (collision_manager.cpp's envPhysXCollisionQuery). Identity (row0=(1,0,0), row1=(0,1,0),
+    // row2=(0,0,1), inv_translation=(0,0,0)) for an object placed at the world origin with no
+    // rotation - a pure no-op in that case, which is why this was never needed while every test
+    // case's real (non-excluded) env objects happened to sit at the origin.
+    float3 inv_rotation_row0, inv_rotation_row1, inv_rotation_row2;
+    float3 inv_translation;
 };
 
 // Same flat-index convention as PhysX's PxSDFIdx (foundation/PxMathUtils.h) and our own
@@ -60,7 +73,14 @@ __device__ __forceinline__ float sdf_read_voxel(const SDFGrid& grid, unsigned in
 // sites, which always pass PX_MAX_F32 (i.e. never reject purely for being outside the box - just
 // pay the linear penalty below); pass something smaller only if out-of-box points should be
 // treated as "unknown, ignore" instead of "far, but still estimable."
-__device__ __forceinline__ float sdf_lookup(const SDFGrid& grid, float3 pos, float tolerance) {
+__device__ __forceinline__ float sdf_lookup(const SDFGrid& grid, float3 world_pos, float tolerance) {
+    // World -> this object's local frame (RSW-2740) - see SDFGrid's own comment on why. A no-op
+    // for an identity-placed object (row0=(1,0,0) etc., inv_translation=(0,0,0)).
+    float3 pos = make_float3(
+        grid.inv_rotation_row0.x * world_pos.x + grid.inv_rotation_row0.y * world_pos.y + grid.inv_rotation_row0.z * world_pos.z + grid.inv_translation.x,
+        grid.inv_rotation_row1.x * world_pos.x + grid.inv_rotation_row1.y * world_pos.y + grid.inv_rotation_row1.z * world_pos.z + grid.inv_translation.y,
+        grid.inv_rotation_row2.x * world_pos.x + grid.inv_rotation_row2.y * world_pos.y + grid.inv_rotation_row2.z * world_pos.z + grid.inv_translation.z);
+
     float3 clamped;
     clamped.x = fminf(fmaxf(pos.x, grid.boundsLower.x), grid.boundsUpper.x);
     clamped.y = fminf(fmaxf(pos.y, grid.boundsLower.y), grid.boundsUpper.y);

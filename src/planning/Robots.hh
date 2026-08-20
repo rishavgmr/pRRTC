@@ -236,26 +236,41 @@ namespace ppln::robots {
         }
     };
 
+    // Per-DOF sampling scale/offset for Fanucm710 (RSW-2740) - q[i]_sampled = q[i]_[0,1] * s_m[i] +
+    // s_a[i], i.e. [s_a[i], s_a[i]+s_m[i]] is the range every random Halton sample gets mapped
+    // into for that dof, so this is what bounds where EXTEND can ever place a node. Runtime-
+    // overridable (not the constexpr arrays this used to be) because these bounds are case-
+    // specific, not robot-level: dof 0 (the rail) is scene_config's own axisLowerLimits/
+    // axisUpperLimits for whichever axis is active, and dofs 1-6 are scene_config's
+    // jointLowerLimits/jointUpperLimits (the same source Manipulator::modifyChains() reads,
+    // matching what P2P itself treats as valid - not robot.urdf's raw hardware limits) - see
+    // uploadJointLimits(), pRRTC_benchmark.cu.
+    //
+    // Declared extern (no storage, no initializer) here on purpose: this header is included by
+    // both pRRTC_benchmark.cu AND scripts/benchmark_fanuc_m710.cpp (a plain .cpp, via
+    // Planners.hh), and a real namespace-scope __constant__ definition in a header gets full
+    // external-linkage storage in every translation unit that includes it - unlike the
+    // static-constexpr-inside-a-function form get_s_m/get_s_a used to have (internal linkage,
+    // safe to repeat per-TU), giving a "multiple definition" link error the moment a second TU
+    // includes this file. The one real definition (with Collins' own values as the compile-time
+    // default) lives in fanuc_m710_benchmark.cuh, which only the .cu ever includes.
+    extern __device__ __constant__ float fanucm710_dof_s_m[7];
+    extern __device__ __constant__ float fanucm710_dof_s_a[7];
+
     struct Fanucm710{
 
     static constexpr auto name = "fanucm710";
     static constexpr std::size_t dimension = 7;
     using Configuration = std::array<float, dimension>;
 
-    __device__ static constexpr float get_s_m(int i) {
-        constexpr float values[] = {
-            3.0, 6.2831854820251465, 3.9269907474517822, 6.457718372344971, 12.566370964050293, 4.363323211669922, 12.566370964050293
-        };
-        return values[i];
+    __device__ static float get_s_m(int i) {
+        return fanucm710_dof_s_m[i];
     }
-    
-    __device__ static constexpr float get_s_a(int i) {
-        constexpr float values[] = {
-            0.0, -3.1415927410125732, -1.5707963705062866, -1.5707963705062866, -6.2831854820251465, -2.181661605834961, -6.2831854820251465
-        };
-        return values[i];
+
+    __device__ static float get_s_a(int i) {
+        return fanucm710_dof_s_a[i];
     }
-    
+
     template<size_t I = 0>
     __device__ __forceinline__ static void scale_cfg_impl(float *q)
     {

@@ -6,9 +6,16 @@ namespace ppln::collision {
 
 
 
-#define FANUCM710_APPROX_SPHERE_COUNT 20
+#define FANUCM710_APPROX_SPHERE_COUNT 39
+#define FANUCM710_APPROX_MAX_TOOL_SPHERES 10
+// Reserved base_link capacity (RSW-2740) - was exactly 4 (Collins's own approx base_link count,
+// with no slack) until pierce_primer's approx-tier base_link needed more for a visually-tuned
+// fit; bumped to 16 for headroom. See uploadRobotOverrides()'s matching kBaseLinkApproxCapacity
+// (pRRTC_benchmark.cu) - the two must stay in sync by convention, same as every other
+// count/capacity pairing in this file.
+#define FANUCM710_APPROX_MAX_BASE_LINK_SPHERES 16
 #define FANUCM710_APPROX_JOINT_COUNT 8
-#define FANUCM710_APPROX_SELF_CC_RANGE_COUNT 16
+#define FANUCM710_APPROX_SELF_CC_RANGE_COUNT 28
 #define FIXED -1
 #define X_PRISM 0
 #define Y_PRISM 1
@@ -38,11 +45,30 @@ __device__ __forceinline__ bool fanucm710_wrist_pair_excluded(int joint_a, int j
     return lo == 6 && hi == 7;
 }
 
-__device__ __constant__ float4 fanucm710_approx_spheres_array[20] = {
-    { -0.07f, 0.01f, 0.033f, 0.34908f },
-    { 0.17f, 0.73f, 0.13f, 0.57f },
-    { 0.0f, 1.4f, 0.1f, 0.6f },
-    { -0.55f, 0.1f, 0.16f, 0.48f },
+__device__ __constant__ float4 fanucm710_approx_spheres_array[39] = {
+    // Reserves FANUCM710_APPROX_MAX_BASE_LINK_SPHERES (16) slots for the current test case's
+    // approx-tier base_link geometry (RSW-2740) - unlike link_1 onward below (frame-invariant,
+    // baked in once), base_link's centers are case-specific (see uploadRobotOverrides()'s own
+    // comment for why) and always fully overwritten by that function before any solve()/
+    // shortcutPath() call runs, for every case including Collins - so these compile-time values
+    // are never actually read; same inert-placeholder convention as the tool-sphere reservation
+    // below regardless.
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
     { 0.07f, 0.128f, -0.049f, 0.3117f },
     { 0.023f, -0.136f, -0.049f, 0.28573f },
     { 0.007f, -0.528f, 0.183f, 0.1628f },
@@ -56,9 +82,19 @@ __device__ __constant__ float4 fanucm710_approx_spheres_array[20] = {
     { 0.002f, -0.003f, -0.872f, 0.14278f },
     { -0.003f, -0.017f, 0.006f, 0.128f },
     { 0.006f, 0.007f, 0.065f, 0.0973f },
-    { -0.13f, 0.009977f, -0.250001f, 0.3f },
-    { 0.0f, 0.209984f, -0.170019f, 0.27f },
-    { 0.041f, -0.12801f, -0.104988f, 0.115f }
+    // Reserves FANUCM710_APPROX_MAX_TOOL_SPHERES (10) slots for whatever tool the current test
+    // case mounts (RSW-2740) - populated at runtime by uploadToolSpheres(), same reasoning and
+    // inert-placeholder convention as fanucm710_spheres_array's tool reservation above.
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f }
 };
 
 __device__ __constant__ float fanucm710_approx_fixed_transforms[] = {
@@ -113,7 +149,19 @@ __device__ __constant__ float fanucm710_approx_fixed_transforms[] = {
     
 };
 
-__device__ __constant__ int fanucm710_approx_sphere_to_joint[20] = {
+__device__ __constant__ int fanucm710_approx_sphere_to_joint[39] = {
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
     1,
     1,
     1,
@@ -130,40 +178,66 @@ __device__ __constant__ int fanucm710_approx_sphere_to_joint[20] = {
     5,
     5,
     6,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
     7,
     7,
     7,
     7
 };
 
-__device__ __constant__ int fanucm710_approx_flattened_joint_to_spheres[28] = {
+__device__ __constant__ int fanucm710_approx_flattened_joint_to_spheres[47] = {
     -1,
     0,
     1,
     2,
     3,
-    -1,
     4,
     5,
-    -1,
     6,
     7,
     8,
     9,
-    -1,
     10,
-    -1,
     11,
     12,
     13,
     14,
-    -1,
     15,
     -1,
     16,
     17,
+    -1,
     18,
     19,
+    20,
+    21,
+    -1,
+    22,
+    -1,
+    23,
+    24,
+    25,
+    26,
+    -1,
+    27,
+    -1,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
     -1
 };
 
@@ -178,23 +252,35 @@ __device__ __constant__ int fanucm710_approx_joint_types[] = {
     5
 };
 
-__device__ __constant__ int fanucm710_approx_self_cc_ranges[16][3] = {
-    { 0, 6, 19 },
-    { 1, 6, 19 },
-    { 2, 6, 19 },
-    { 3, 6, 19 },
-    { 4, 10, 19 },
-    { 5, 10, 19 },
-    { 6, 11, 19 },
-    { 7, 11, 19 },
-    { 8, 11, 19 },
-    { 9, 11, 19 },
-    { 10, 17, 19 },
-    { 11, 16, 19 },
-    { 12, 16, 19 },
-    { 13, 16, 19 },
-    { 14, 16, 19 },
-    { 15, 17, 19 }
+__device__ __constant__ int fanucm710_approx_self_cc_ranges[28][3] = {
+    { 0, 18, 38 },
+    { 1, 18, 38 },
+    { 2, 18, 38 },
+    { 3, 18, 38 },
+    { 4, 18, 38 },
+    { 5, 18, 38 },
+    { 6, 18, 38 },
+    { 7, 18, 38 },
+    { 8, 18, 38 },
+    { 9, 18, 38 },
+    { 10, 18, 38 },
+    { 11, 18, 38 },
+    { 12, 18, 38 },
+    { 13, 18, 38 },
+    { 14, 18, 38 },
+    { 15, 18, 38 },
+    { 16, 22, 38 },
+    { 17, 22, 38 },
+    { 18, 23, 38 },
+    { 19, 23, 38 },
+    { 20, 23, 38 },
+    { 21, 23, 38 },
+    { 22, 29, 38 },
+    { 23, 28, 38 },
+    { 24, 28, 38 },
+    { 25, 28, 38 },
+    { 26, 28, 38 },
+    { 27, 29, 38 }
 };
 
 __device__ __constant__ int fanucm710_approx_joint_parents[8] = {
@@ -297,6 +383,20 @@ __device__ void fk_approx<ppln::robots::Fanucm710>(
             for (int r=0; r<4; r++){
                 T_col_tmp[r] = dot4_col(&T_base[T_memory_idx_parent*16 + r], T_step_col);
             }
+            // RSW-2740: T_memory_idx_parent == T_memory_idx for this robot's chain (a single
+            // shared accumulator slot, not one per joint) - the read above and the write below
+            // therefore touch the SAME memory, and every col_ind thread does both. Without a
+            // sync between them, a faster thread's write here can land before a slower thread's
+            // read above finishes, handing that thread a mix of old and new matrix data - a real,
+            // GPU-scheduling-dependent race (confirmed via compute-sanitizer --tool racecheck,
+            // "Potential WAR hazard (Warp Level Programming)" at this exact line, and empirically
+            // via pierce_primer's benchmark returning collision-passing-through-workpiece paths
+            // nondeterministically despite provably identical input data across runs). All 4
+            // col_ind threads for a batch share a warp (col_ind = tid % 4, so 4 consecutive
+            // threads), so a plain __syncwarp() is sufficient here (and correctly required,
+            // unlike the pre-existing __syncwarp() right after this block, which only guards the
+            // start of the *next* section against this one, not the read/write pair within it).
+            __syncwarp();
             for (int r=0; r<4; r++){
                 T_base[T_memory_idx*16 + col_ind*4 + r] = T_col_tmp[r];
             }
@@ -436,7 +536,8 @@ __device__ bool fanucm710_env_collision_check_approx_sdf(
 
 
 
-#define FANUCM710_SPHERE_COUNT 112
+#define FANUCM710_SPHERE_COUNT 148
+#define FANUCM710_MAX_TOOL_SPHERES 80
 #define FANUCM710_JOINT_COUNT 8
 #define FANUCM710_SELF_CC_RANGE_COUNT 63
 #define FIXED -1
@@ -448,7 +549,7 @@ __device__ bool fanucm710_env_collision_check_approx_sdf(
 #define Z_ROT 5
 #define BATCH_SIZE 16
 
-__device__ __constant__ float4 fanucm710_spheres_array[112] = {
+__device__ __constant__ float4 fanucm710_spheres_array[148] = {
     { 0.279f, 0.653f, 0.188f, 0.23272f },
     { -0.132f, 0.972f, 0.158f, 0.20229f },
     { -0.104f, 0.213f, 0.157f, 0.20229f },
@@ -517,57 +618,94 @@ __device__ __constant__ float4 fanucm710_spheres_array[112] = {
     { 0.032f, -0.022f, 0.01f, 0.024f },
     { 0.029f, 0.029f, 0.011f, 0.024f },
     { -0.019f, 0.037f, 0.011f, 0.024f },
-    // Replaces the 16 generic-tool spheres previously here with the 44 spheres actually used by
-    // benchmark_p2p.cpp's Collins comparison (TCP_5_1_P2P_spheres.yaml, loaded there via
-    // addPhysXTool) - the old 16 were from whatever tool0 fine_spheres.urdf happened to be
-    // authored against, not the tool this benchmark is supposed to be comparing against.
-    // Transformed into joint7/link_6's local frame via (x, -y, -z) - the same 180-degree
-    // rotation about X confirmed against the original 16 spheres (matched to ~2e-5 on 4
-    // independent samples); radius is unaffected by rotation.
-    { 0.001f, -0.009f, -0.111f, 0.121f },
-    { -0.007f, 0.243f, -0.107f, 0.09f },
-    { 0.041f, -0.128f, -0.105f, 0.115f },
-    { -0.053f, 0.008f, -0.258f, 0.1f },
-    { 0.061f, 0.011f, -0.227f, 0.1f },
-    { -0.019f, -0.162f, -0.096f, 0.106f },
-    { -0.001f, 0.242f, -0.021f, 0.1f },
-    { -0.041f, 0.028f, -0.138f, 0.106f },
-    { 0.044f, -0.008f, -0.119f, 0.118f },
-    { -0.084f, -0.153f, -0.142f, 0.088f },
-    { 0.058f, -0.002f, -0.264f, 0.094f },
-    { 0.001f, -0.24f, -0.156f, 0.079f },
-    { -0.062f, -0.087f, -0.115f, 0.088f },
-    { 0.013f, -0.244f, -0.061f, 0.077f },
-    { 0.088f, -0.151f, -0.161f, 0.073f },
-    { 0.074f, 0.033f, -0.069f, 0.079f },
-    { -0.052f, 0.009f, -0.202f, 0.099f },
-    { 0.081f, -0.033f, -0.222f, 0.079f },
-    { -0.133f, 0.001f, -0.263f, 0.06f },
-    { -0.007f, 0.24f, 0.075f, 0.082f },
-    { -0.082f, -0.154f, -0.066f, 0.069f },
-    { -0.075f, 0.039f, -0.059f, 0.069f },
-    { 0.007f, 0.128f, -0.005f, 0.07f },
-    { 0.102f, -0.069f, -0.05f, 0.06f },
-    { 0.105f, -0.158f, -0.054f, 0.057f },
-    { 0.104f, 0.046f, -0.301f, 0.056f },
-    { 0.026f, 0.046f, -0.301f, 0.056f },
-    { 0.019f, -0.044f, -0.301f, 0.056f },
-    { 0.103f, -0.04f, -0.302f, 0.056f },
-    { -0.007f, 0.061f, -0.259f, 0.056f },
-    { -0.348f, -0.0f, -0.258f, 0.025f },
-    { -0.348f, -0.038f, -0.258f, 0.025f },
-    { -0.348f, -0.029f, -0.283f, 0.025f },
-    { -0.348f, -0.007f, -0.296f, 0.025f },
-    { -0.348f, 0.019f, -0.291f, 0.025f },
-    { -0.348f, 0.036f, -0.271f, 0.025f },
-    { -0.348f, 0.036f, -0.245f, 0.025f },
-    { -0.348f, 0.019f, -0.225f, 0.025f },
-    { -0.348f, -0.007f, -0.22f, 0.025f },
-    { -0.348f, -0.029f, -0.233f, 0.025f },
-    { -0.286f, -0.0f, -0.258f, 0.062f },
-    { -0.282f, -0.0f, -0.258f, 0.062f },
-    { -0.22f, -0.0f, -0.258f, 0.062f },
-    { -0.157f, -0.0f, -0.258f, 0.062f }
+    // Reserves FANUCM710_MAX_TOOL_SPHERES (80) slots for whatever tool the current test case
+    // mounts (RSW-2740) - populated at runtime by uploadToolSpheres(), not baked in here, so
+    // switching tools/test cases never requires touching this file or re-running cricket. All
+    // slots default to this inert placeholder (a sphere so far outside the workspace, with zero
+    // radius, that it can never register a self- or env-collision under the existing formulas
+    // unchanged - see sdf_lookup()'s out-of-bounds clamp-distance penalty and
+    // sphere_sphere_sql2's r1+r2 sum) - uploadToolSpheres() overwrites the first N with the
+    // active tool's real spheres and leaves the rest exactly as-is for tools with fewer than 80.
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f },
+    { 1e6f, 1e6f, 1e6f, 0.0f }
 };
 
 __device__ __constant__ float fanucm710_fixed_transforms[] = {
@@ -622,7 +760,7 @@ __device__ __constant__ float fanucm710_fixed_transforms[] = {
     
 };
 
-__device__ __constant__ int fanucm710_sphere_to_joint[112] = {
+__device__ __constant__ int fanucm710_sphere_to_joint[148] = {
     1,
     1,
     1,
@@ -686,14 +824,47 @@ __device__ __constant__ int fanucm710_sphere_to_joint[112] = {
     6,
     6,
     6,
-    // link_6's 5 spheres, unchanged.
     7,
     7,
     7,
     7,
     7,
-    // tool0's 44 spheres (TCP_5_1), all sharing joint7's transform since tool0 is rigidly
-    // fixed to link_6 with no relative DOF.
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
     7,
     7,
     7,
@@ -740,7 +911,7 @@ __device__ __constant__ int fanucm710_sphere_to_joint[112] = {
     7
 };
 
-__device__ __constant__ int fanucm710_flattened_joint_to_spheres[120] = {
+__device__ __constant__ int fanucm710_flattened_joint_to_spheres[156] = {
     -1,
     0,
     1,
@@ -860,6 +1031,42 @@ __device__ __constant__ int fanucm710_flattened_joint_to_spheres[120] = {
     109,
     110,
     111,
+    112,
+    113,
+    114,
+    115,
+    116,
+    117,
+    118,
+    119,
+    120,
+    121,
+    122,
+    123,
+    124,
+    125,
+    126,
+    127,
+    128,
+    129,
+    130,
+    131,
+    132,
+    133,
+    134,
+    135,
+    136,
+    137,
+    138,
+    139,
+    140,
+    141,
+    142,
+    143,
+    144,
+    145,
+    146,
+    147,
     -1
 };
 
@@ -875,69 +1082,69 @@ __device__ __constant__ int fanucm710_joint_types[] = {
 };
 
 __device__ __constant__ int fanucm710_self_cc_ranges[63][3] = {
-    { 0, 28, 111 },
-    { 1, 28, 111 },
-    { 2, 28, 111 },
-    { 3, 28, 111 },
-    { 4, 28, 111 },
-    { 5, 28, 111 },
-    { 6, 28, 111 },
-    { 7, 28, 111 },
-    { 8, 28, 111 },
-    { 9, 28, 111 },
-    { 10, 28, 111 },
-    { 11, 28, 111 },
-    { 12, 28, 111 },
-    { 13, 28, 111 },
-    { 14, 28, 111 },
-    { 15, 28, 111 },
-    { 16, 28, 111 },
-    { 17, 28, 111 },
-    { 18, 28, 111 },
-    { 19, 28, 111 },
-    { 20, 28, 111 },
-    { 21, 28, 111 },
-    { 22, 28, 111 },
-    { 23, 28, 111 },
-    { 24, 42, 111 },
-    { 25, 42, 111 },
-    { 26, 42, 111 },
-    { 27, 42, 111 },
-    { 28, 49, 111 },
-    { 29, 49, 111 },
-    { 30, 49, 111 },
-    { 31, 49, 111 },
-    { 32, 49, 111 },
-    { 33, 49, 111 },
-    { 34, 49, 111 },
-    { 35, 49, 111 },
-    { 36, 49, 111 },
-    { 37, 49, 111 },
-    { 38, 49, 111 },
-    { 39, 49, 111 },
-    { 40, 49, 111 },
-    { 41, 49, 111 },
-    { 42, 68, 111 },
-    { 43, 68, 111 },
-    { 44, 68, 111 },
-    { 45, 68, 111 },
-    { 46, 68, 111 },
-    { 47, 68, 111 },
-    { 48, 68, 111 },
-    { 49, 63, 111 },
-    { 50, 63, 111 },
-    { 51, 63, 111 },
-    { 52, 63, 111 },
-    { 53, 63, 111 },
-    { 54, 63, 111 },
-    { 55, 63, 111 },
-    { 56, 63, 111 },
-    { 57, 63, 111 },
-    { 58, 63, 111 },
-    { 59, 68, 111 },
-    { 60, 68, 111 },
-    { 61, 68, 111 },
-    { 62, 68, 111 }
+    { 0, 28, 147 },
+    { 1, 28, 147 },
+    { 2, 28, 147 },
+    { 3, 28, 147 },
+    { 4, 28, 147 },
+    { 5, 28, 147 },
+    { 6, 28, 147 },
+    { 7, 28, 147 },
+    { 8, 28, 147 },
+    { 9, 28, 147 },
+    { 10, 28, 147 },
+    { 11, 28, 147 },
+    { 12, 28, 147 },
+    { 13, 28, 147 },
+    { 14, 28, 147 },
+    { 15, 28, 147 },
+    { 16, 28, 147 },
+    { 17, 28, 147 },
+    { 18, 28, 147 },
+    { 19, 28, 147 },
+    { 20, 28, 147 },
+    { 21, 28, 147 },
+    { 22, 28, 147 },
+    { 23, 28, 147 },
+    { 24, 42, 147 },
+    { 25, 42, 147 },
+    { 26, 42, 147 },
+    { 27, 42, 147 },
+    { 28, 49, 147 },
+    { 29, 49, 147 },
+    { 30, 49, 147 },
+    { 31, 49, 147 },
+    { 32, 49, 147 },
+    { 33, 49, 147 },
+    { 34, 49, 147 },
+    { 35, 49, 147 },
+    { 36, 49, 147 },
+    { 37, 49, 147 },
+    { 38, 49, 147 },
+    { 39, 49, 147 },
+    { 40, 49, 147 },
+    { 41, 49, 147 },
+    { 42, 68, 147 },
+    { 43, 68, 147 },
+    { 44, 68, 147 },
+    { 45, 68, 147 },
+    { 46, 68, 147 },
+    { 47, 68, 147 },
+    { 48, 68, 147 },
+    { 49, 63, 147 },
+    { 50, 63, 147 },
+    { 51, 63, 147 },
+    { 52, 63, 147 },
+    { 53, 63, 147 },
+    { 54, 63, 147 },
+    { 55, 63, 147 },
+    { 56, 63, 147 },
+    { 57, 63, 147 },
+    { 58, 63, 147 },
+    { 59, 68, 147 },
+    { 60, 68, 147 },
+    { 61, 68, 147 },
+    { 62, 68, 147 }
 };
 
 __device__ __constant__ int fanucm710_joint_parents[8] = {
@@ -1040,6 +1247,20 @@ __device__ void fk<ppln::robots::Fanucm710>(
             for (int r=0; r<4; r++){
                 T_col_tmp[r] = dot4_col(&T_base[T_memory_idx_parent*16 + r], T_step_col);
             }
+            // RSW-2740: T_memory_idx_parent == T_memory_idx for this robot's chain (a single
+            // shared accumulator slot, not one per joint) - the read above and the write below
+            // therefore touch the SAME memory, and every col_ind thread does both. Without a
+            // sync between them, a faster thread's write here can land before a slower thread's
+            // read above finishes, handing that thread a mix of old and new matrix data - a real,
+            // GPU-scheduling-dependent race (confirmed via compute-sanitizer --tool racecheck,
+            // "Potential WAR hazard (Warp Level Programming)" at this exact line, and empirically
+            // via pierce_primer's benchmark returning collision-passing-through-workpiece paths
+            // nondeterministically despite provably identical input data across runs). All 4
+            // col_ind threads for a batch share a warp (col_ind = tid % 4, so 4 consecutive
+            // threads), so a plain __syncwarp() is sufficient here (and correctly required,
+            // unlike the pre-existing __syncwarp() right after this block, which only guards the
+            // start of the *next* section against this one, not the read/write pair within it).
+            __syncwarp();
             for (int r=0; r<4; r++){
                 T_base[T_memory_idx*16 + col_ind*4 + r] = T_col_tmp[r];
             }
@@ -1155,4 +1376,23 @@ __device__ bool fanucm710_env_collision_check_sdf(
     }
     return true;
 }
+}
+
+namespace ppln::robots {
+
+// Real definition of the extern arrays declared in Robots.hh's Fanucm710 struct (RSW-2740) - see
+// that declaration's own comment for why this needs to live here (the one file this header's
+// arrays' matching TU, pRRTC_benchmark.cu, includes) rather than in Robots.hh directly. Defaults
+// are Collins' own case: dof 0 (rail) from its rail length (0 to 3.0, see
+// robots/fanuc_m710/fine_spheres.urdf's world_joint limit); dofs 1-6 from robot.urdf's hardware
+// limits (close to but not identical to Collins' own tighter operational jointLowerLimits/
+// jointUpperLimits). Both get overwritten by uploadJointLimits() before any solve() call runs,
+// for every case including Collins, so these compile-time values are in practice never read.
+__device__ __constant__ float fanucm710_dof_s_m[7] = {
+    3.0f, 6.2831854820251465f, 3.9269907474517822f, 6.457718372344971f, 12.566370964050293f, 4.363323211669922f, 12.566370964050293f
+};
+__device__ __constant__ float fanucm710_dof_s_a[7] = {
+    0.0f, -3.1415927410125732f, -1.5707963705062866f, -1.5707963705062866f, -6.2831854820251465f, -2.181661605834961f, -6.2831854820251465f
+};
+
 }

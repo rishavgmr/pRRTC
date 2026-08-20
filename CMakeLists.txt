@@ -104,4 +104,5 @@ target_link_libraries(benchmark_fanuc_m710
 
 target_compile_options(benchmark_fanuc_m710 PRIVATE
     -Wno-c++11-narrowing
+    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
 )
