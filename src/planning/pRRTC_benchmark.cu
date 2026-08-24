@@ -330,6 +330,13 @@ namespace pRRTC
 
         cost = 0.0f;
         reached_goal_idx = 0;
+        // RSW-2740: solved_iters was the one state variable this kernel didn't already cover -
+        // it's only ever written on the "found a connection" path (solved_iters = iter), so a
+        // run that doesn't solve leaves it holding whatever the previous run last wrote, and
+        // h_solved_iters is read back unconditionally regardless of whether this run solved.
+        // Without cudaDeviceReset() between calls (see solve()'s own comment below), that stale
+        // value would otherwise leak into the next run's reported result.
+        solved_iters = 0;
     }
 
     void reset_device_variables()
@@ -1082,7 +1089,15 @@ namespace pRRTC
         cudaFreeHost(h_solved);
         cudaCheckError(cudaGetLastError());
         res.wall_ns = get_elapsed_nanoseconds(start_time);
-        cudaDeviceReset();
+        // RSW-2740: removed the cudaDeviceReset() that used to sit here (measured at ~49-61ms
+        // per call standalone - see the RSW-2740 benchmarking notes). reset_device_variables()
+        // just above already explicitly zeroes every mutable __device__ global this function
+        // touches (solved, both atomic counters, path/path_size, cost, reached_goal_idx, and now
+        // solved_iters too - see that kernel's own comment), so a full context teardown+rebuild
+        // was redundant with it for correctness. The one thing cudaDeviceReset() additionally
+        // wiped - __constant__ memory (SDF grids, joint limits, settings) - is the caller's
+        // responsibility to upload before calling solve() in the first place; it no longer needs
+        // to be re-uploaded between calls now that nothing wipes it out from under the caller.
         return res;
     }
 

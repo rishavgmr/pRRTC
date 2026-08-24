@@ -961,3 +961,21 @@ __device__ bool env_collision_check<ppln::robots::Fanucm710>(volatile float* sph
     return true;
 }
 }
+
+namespace ppln::robots {
+
+// Real definition of the extern arrays declared in Robots.hh's Fanucm710 struct (RSW-2740) - see
+// that declaration's own comment for why this needs to live here (the one file this header's
+// arrays' matching TU includes) rather than in Robots.hh directly. Defaults are Collins' own
+// case: dof 0 (rail) from its rail length; dofs 1-6 from robot.urdf's hardware limits. Both get
+// overwritten by uploadJointLimits() before any solve() call runs, for every case including
+// Collins, so these compile-time values are in practice never read. Mirrors
+// fanuc_m710_benchmark.cuh's own copy of this same block exactly.
+__device__ __constant__ float fanucm710_dof_s_m[7] = {
+    3.0f, 6.2831854820251465f, 3.9269907474517822f, 6.457718372344971f, 12.566370964050293f, 4.363323211669922f, 12.566370964050293f
+};
+__device__ __constant__ float fanucm710_dof_s_a[7] = {
+    0.0f, -3.1415927410125732f, -1.5707963705062866f, -1.5707963705062866f, -6.2831854820251465f, -2.181661605834961f, -6.2831854820251465f
+};
+
+}

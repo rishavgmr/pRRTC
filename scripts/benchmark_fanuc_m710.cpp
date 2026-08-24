@@ -592,50 +592,35 @@ int main() {
     std::vector<double> kernel_times_s;
     nlohmann::json runs = nlohmann::json::array();
 
+    // Uploaded ONCE, not per-run (RSW-2740): this __constant__ state used to get wiped by
+    // solve()'s own cudaDeviceReset() at the end of every call, which is why every run (and
+    // every post-solve shortcutPath()) used to have to re-upload it from these same host-side
+    // buffers. Now that solve() no longer resets the device between calls, nothing wipes this
+    // out from under us, so a single upload before the whole run loop is sufficient - this
+    // removes ~25-30ms/run of otherwise-unnecessary PCIe transfer (the SDF grids alone are
+    // ~430MB), previously excluded from the reported planning_time_s only by explicit
+    // subtraction, not because the cost wasn't real.
+    pRRTC::uploadSDFEnvironment(sdf_grids, sdf_link_mask, kSelfCollisionOffsetM);
+    pRRTC::uploadToolSpheres(fine_tool_spheres, approx_tool_spheres);
+    pRRTC::uploadRobotOverrides(base_link_fine_spheres, base_link_approx_spheres, frames1_rotation);
+    pRRTC::uploadJointLimits(joint_limit_lower, joint_limit_upper);
+
     for (int i = 0; i < kNumRuns; ++i) {
         std::cout << "Starting run " << i << " (max_iters=" << settings.max_iters << ")...\n";
-        // Re-upload before every run, not just once - see load_sdf_environment()'s comment for
-        // why: solve()'s own cudaDeviceReset() wipes this __constant__ state at the end of every
-        // call, so without re-uploading here, every run after the first (and even run 0's own
-        // shortcutPath phase) would silently check against zero environment objects. Done from
-        // already-loaded host memory (no disk re-read) and before starting the timer, so this
-        // doesn't get counted as planning time.
-        pRRTC::uploadSDFEnvironment(sdf_grids, sdf_link_mask, kSelfCollisionOffsetM);
-        pRRTC::uploadToolSpheres(fine_tool_spheres, approx_tool_spheres);
-        pRRTC::uploadRobotOverrides(base_link_fine_spheres, base_link_approx_spheres, frames1_rotation);
-        pRRTC::uploadJointLimits(joint_limit_lower, joint_limit_upper);
 
         auto t0 = std::chrono::steady_clock::now();
         auto result = pRRTC::solve<Robot>(start, goals, env, settings);
 
         double cost_before_shortcut = 0.0;
         double cost_after_shortcut = 0.0;
-        double reupload_s = 0.0;
         if (result.solved) {
             cost_before_shortcut = path_cost(result.path);
-            // solve() (just returned above) ends with its own cudaDeviceReset() call, which
-            // wipes the same __constant__ state uploadSDFEnvironment() just populated - same
-            // bug as the run-loop re-upload above, just at this second call site. Without
-            // re-uploading here, shortcutPath's edge validation would silently see zero
-            // environment objects (env/workpiece collision checking disabled) and an unset
-            // self-collision offset, for every run, not just run 0. Re-uploaded from the same
-            // already-loaded host memory, so this doesn't re-read the .bin files either. Timed
-            // and subtracted from planning_time_s below - like the pre-solve upload above, this
-            // is purely a benchmark-only artifact of solve()'s cudaDeviceReset(), not a cost P2P
-            // itself pays, so it shouldn't count as planning time.
-            auto tu0 = std::chrono::steady_clock::now();
-            pRRTC::uploadSDFEnvironment(sdf_grids, sdf_link_mask, kSelfCollisionOffsetM);
-            pRRTC::uploadToolSpheres(fine_tool_spheres, approx_tool_spheres);
-            pRRTC::uploadRobotOverrides(base_link_fine_spheres, base_link_approx_spheres, frames1_rotation);
-            pRRTC::uploadJointLimits(joint_limit_lower, joint_limit_upper);
-            auto tu1 = std::chrono::steady_clock::now();
-            reupload_s = std::chrono::duration<double>(tu1 - tu0).count();
             result.path =
                 pRRTC::shortcutPath<Robot>(result.path, settings.range, settings.granularity, kShortcutMaxAttempts);
             cost_after_shortcut = path_cost(result.path);
         }
         auto t1 = std::chrono::steady_clock::now();
-        const double planning_time_s = std::chrono::duration<double>(t1 - t0).count() - reupload_s;
+        const double planning_time_s = std::chrono::duration<double>(t1 - t0).count();
         std::cout << "  run " << i << " returned after " << planning_time_s
                    << "s (host-side, solve+shortcut)\n";
 
