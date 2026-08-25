@@ -31,16 +31,11 @@ Parallelized RRTC: Each block works to add a config to the tree (either start or
 namespace pRRTC
 {
     using namespace ppln;
-    __device__ volatile int solved = 0;
-    __device__ volatile int atomic_free_index[2]; // separate for tree_a and tree_b
-    __device__ volatile int nodes_size[2];
-    __device__ volatile int completed_nodes[2]; // track completed nodes for each tree
+    // RSW-2740: these used to be __device__ globals, shared by every solve() call and reset
+    // between calls via reset_device_variables_kernel() - which made concurrent solve()s on
+    // different problems race on them. Now cudaMalloc'd fresh per call in solve() and passed
+    // into rrtc() as pointer parameters, mirroring nodes/parents/radii below (already reentrant).
     constexpr int MAX_PATH_SIZE = 5000;
-    __device__ float path[2][MAX_PATH_SIZE]; // solution path segments for tree_a, and tree_b
-    __device__ int path_size[2] = {0, 0};
-    __device__ float cost = 0.0;
-    __device__ int reached_goal_idx = 0;
-    __device__ int solved_iters = 0; // value of iters in the block that solves the problem
     __constant__ pRRTC_settings d_settings;
 
     constexpr int MAX_GRANULARITY = 32;
@@ -306,49 +301,11 @@ namespace pRRTC
         cudaFree(d_env);
     }
 
-    __global__ void reset_device_variables_kernel()
-    {
-        solved = 0;
-
-        atomic_free_index[0] = 0;
-        atomic_free_index[1] = 0;
-        nodes_size[0] = 0;
-        nodes_size[1] = 0;
-        completed_nodes[0] = 0;
-        completed_nodes[1] = 0;
-
-        path_size[0] = 0;
-        path_size[1] = 0;
-
-        for (int tree = 0; tree < 2; tree++)
-        {
-            for (int i = 0; i < MAX_PATH_SIZE; i++)
-            {
-                path[tree][i] = 0.0f;
-            }
-        }
-
-        cost = 0.0f;
-        reached_goal_idx = 0;
-        // RSW-2740: solved_iters was the one state variable this kernel didn't already cover -
-        // it's only ever written on the "found a connection" path (solved_iters = iter), so a
-        // run that doesn't solve leaves it holding whatever the previous run last wrote, and
-        // h_solved_iters is read back unconditionally regardless of whether this run solved.
-        // Without cudaDeviceReset() between calls (see solve()'s own comment below), that stale
-        // value would otherwise leak into the next run's reported result.
-        solved_iters = 0;
-    }
-
-    void reset_device_variables()
-    {
-        reset_device_variables_kernel<<<1, 1>>>();
-        cudaDeviceSynchronize();
-        cudaError_t error = cudaGetLastError();
-        if (error != cudaSuccess)
-        {
-            printf("CUDA error: %s\n", cudaGetErrorString(error));
-        }
-    }
+    // RSW-2740: reset_device_variables_kernel()/reset_device_variables() removed - their entire
+    // purpose was zeroing the __device__ globals above between calls so the next solve() didn't
+    // see stale state. Now that those are per-call cudaMalloc'd buffers (see rrtc()'s new pointer
+    // params and solve() below), each call gets fresh memory and explicitly initializes only the
+    // handful of buffers the kernel accumulates into or reads unconditionally on the host side.
 
     __device__ __forceinline__ void reset_to_unwritten_state(volatile float *buffer, int size, int tid)
     {
@@ -370,7 +327,15 @@ namespace pRRTC
         int **parents,
         float **radii,
         HaltonState<Robot> *halton_states,
-        curandState *rng_states)
+        curandState *rng_states,
+        volatile int *d_solved,
+        volatile int *d_atomic_free_index,
+        volatile int *d_completed_nodes,
+        float (*d_path)[MAX_PATH_SIZE],
+        int *d_path_size,
+        float *d_cost,
+        int *d_reached_goal_idx,
+        int *d_solved_iters)
     {
         static constexpr auto dim = Robot::dimension;
         const int tid = threadIdx.x;
@@ -408,7 +373,7 @@ namespace pRRTC
                 iter++;
                 if (iter > d_settings.max_iters)
                 {
-                    atomicCAS((int *)&solved, 0, -1);
+                    atomicCAS((int *)d_solved, 0, -1);
                 }
 
                 if (d_settings.balance == 0 || iter == 1)
@@ -416,16 +381,16 @@ namespace pRRTC
                     t_tree_id = (bid < (d_settings.num_new_configs / 2)) ? 0 : 1;
                     o_tree_id = 1 - t_tree_id;
                 }
-                else if (d_settings.balance == 1 && abs(atomic_free_index[0] - atomic_free_index[1]) < 1.5 * d_settings.num_new_configs)
+                else if (d_settings.balance == 1 && abs(d_atomic_free_index[0] - d_atomic_free_index[1]) < 1.5 * d_settings.num_new_configs)
                 { // dynamic balance
-                    float ratio = atomic_free_index[0] / (float)(atomic_free_index[0] + atomic_free_index[1]);
+                    float ratio = d_atomic_free_index[0] / (float)(d_atomic_free_index[0] + d_atomic_free_index[1]);
                     float balance_factor = 1 - ratio;
                     t_tree_id = (bid < (d_settings.num_new_configs * balance_factor)) ? 0 : 1;
                     o_tree_id = 1 - t_tree_id;
                 }
                 else if (d_settings.balance == 1)
                 {
-                    float ratio = atomic_free_index[0] / (float)(atomic_free_index[0] + atomic_free_index[1]);
+                    float ratio = d_atomic_free_index[0] / (float)(d_atomic_free_index[0] + d_atomic_free_index[1]);
                     if (ratio < d_settings.tree_ratio)
                         t_tree_id = 0;
                     else
@@ -434,7 +399,7 @@ namespace pRRTC
                 }
                 else if (d_settings.balance == 2)
                 { // vamp balance
-                    float ratio = abs(atomic_free_index[t_tree_id] - atomic_free_index[o_tree_id]) / (float)atomic_free_index[t_tree_id];
+                    float ratio = abs(d_atomic_free_index[t_tree_id] - d_atomic_free_index[o_tree_id]) / (float)d_atomic_free_index[t_tree_id];
                     if (ratio < d_settings.tree_ratio)
                     {
                         t_tree_id = 1 - t_tree_id;
@@ -474,7 +439,7 @@ namespace pRRTC
             float local_min_dist = FLT_MAX;
             int local_near_idx = 0;
             float dist;
-            int size = min(atomic_free_index[t_tree_id], completed_nodes[t_tree_id]);
+            int size = min(d_atomic_free_index[t_tree_id], d_completed_nodes[t_tree_id]);
             for (int i = tid; i < size; i += blockDim.x)
             {
                 dist = device_utils::sq_l2_dist((float *)&t_nodes[i * dim], (float *)config, dim);
@@ -639,9 +604,9 @@ namespace pRRTC
                 if (tid == 0)
                 {
                     // printf("edge good\n");
-                    index = atomicAdd((int *)&atomic_free_index[t_tree_id], 1);
+                    index = atomicAdd((int *)&d_atomic_free_index[t_tree_id], 1);
                     if (index >= d_settings.max_samples)
-                        solved = -1;
+                        *d_solved = -1;
 
                     t_parents[index] = sindex[0];
 
@@ -676,7 +641,7 @@ namespace pRRTC
                 }
                 if (tid == 0)
                 {
-                    atomicAdd((int *)&completed_nodes[t_tree_id], 1);
+                    atomicAdd((int *)&d_completed_nodes[t_tree_id], 1);
                     __threadfence();
                 }
                 __syncthreads();
@@ -684,7 +649,7 @@ namespace pRRTC
                 // connect
                 local_min_dist = FLT_MAX;
                 local_near_idx = 0;
-                int size = min(atomic_free_index[o_tree_id], completed_nodes[o_tree_id]);
+                int size = min(d_atomic_free_index[o_tree_id], d_completed_nodes[o_tree_id]);
                 for (unsigned int i = tid; i < size; i += blockDim.x)
                 {
                     dist = device_utils::sq_l2_dist((float *)&o_nodes[i * dim], (float *)config, dim);
@@ -839,9 +804,9 @@ namespace pRRTC
                         break;
                     if (tid == 0)
                     {
-                        index = atomicAdd((int *)&atomic_free_index[t_tree_id], 1);
+                        index = atomicAdd((int *)&d_atomic_free_index[t_tree_id], 1);
                         if (index >= d_settings.max_samples)
-                            solved = -1;
+                            *d_solved = -1;
                         t_parents[index] = extension_parent_idx;
                         radii[t_tree_id][index] = FLT_MAX;
                         extension_parent_idx = index;
@@ -856,7 +821,7 @@ namespace pRRTC
                     }
                     if (tid == 0)
                     {
-                        atomicAdd((int *)&completed_nodes[t_tree_id], 1);
+                        atomicAdd((int *)&d_completed_nodes[t_tree_id], 1);
                         __threadfence();
                     }
                     __syncthreads();
@@ -865,7 +830,7 @@ namespace pRRTC
                 }
                 if (i_extensions == n_extensions)
                 { // connected
-                    if (tid == 0 && atomicCAS((int *)&solved, 0, 1) == 0)
+                    if (tid == 0 && atomicCAS((int *)d_solved, 0, 1) == 0)
                     {
                         // trace back to the start and goal.
                         int current = index;
@@ -875,29 +840,29 @@ namespace pRRTC
                         while (t_parents[current] != current)
                         {
                             parent = t_parents[current];
-                            cost += device_utils::l2_dist((float *)&t_nodes[current * dim], (float *)&t_nodes[parent * dim], dim);
+                            *d_cost += device_utils::l2_dist((float *)&t_nodes[current * dim], (float *)&t_nodes[parent * dim], dim);
                             for (int i = 0; i < dim; i++)
-                                path[t_tree_id][t_path_size * dim + i] = t_nodes[current * dim + i];
+                                d_path[t_tree_id][t_path_size * dim + i] = t_nodes[current * dim + i];
                             t_path_size++;
                             current = parent;
                         }
                         if (t_tree_id == 1)
-                            reached_goal_idx = current;
+                            *d_reached_goal_idx = current;
                         current = sindex[0];
                         while (o_parents[current] != current)
                         {
                             parent = o_parents[current];
-                            cost += device_utils::l2_dist((float *)&o_nodes[current * dim], (float *)&o_nodes[parent * dim], dim);
+                            *d_cost += device_utils::l2_dist((float *)&o_nodes[current * dim], (float *)&o_nodes[parent * dim], dim);
                             for (int i = 0; i < dim; i++)
-                                path[o_tree_id][o_path_size * dim + i] = o_nodes[current * dim + i];
+                                d_path[o_tree_id][o_path_size * dim + i] = o_nodes[current * dim + i];
                             o_path_size++;
                             current = parent;
                         }
                         if (t_tree_id == 0)
-                            reached_goal_idx = current;
-                        path_size[t_tree_id] = t_path_size;
-                        path_size[o_tree_id] = o_path_size;
-                        solved_iters = iter;
+                            *d_reached_goal_idx = current;
+                        d_path_size[t_tree_id] = t_path_size;
+                        d_path_size[o_tree_id] = o_path_size;
+                        *d_solved_iters = iter;
                     }
                     __syncthreads();
                 }
@@ -924,7 +889,7 @@ namespace pRRTC
                 } while (atomicCAS((int *)radius_ptr, expected, desired) != expected);
             }
             __syncthreads();
-            if (solved != 0)
+            if (*d_solved != 0)
                 return;
         }
     }
@@ -987,14 +952,52 @@ namespace pRRTC
         int numBlocks1 = (settings.num_new_configs + BLOCK_SIZE - 1) / BLOCK_SIZE;
         init_halton<Robot><<<numBlocks1, BLOCK_SIZE>>>(halton_states, rng_states);
 
+        // RSW-2740: per-call reentrant state - was __device__ globals shared across calls
+        // (reset between calls via reset_device_variables_kernel()), now cudaMalloc'd fresh
+        // here and cudaFree'd at the end of this function, matching nodes/parents/radii above.
+        volatile int *d_solved;
+        volatile int *d_atomic_free_index;
+        volatile int *d_completed_nodes;
+        float (*d_path)[MAX_PATH_SIZE];
+        int *d_path_size;
+        float *d_cost;
+        int *d_reached_goal_idx;
+        int *d_solved_iters;
+        cudaMalloc((void **)&d_solved, sizeof(int));
+        cudaMalloc((void **)&d_atomic_free_index, 2 * sizeof(int));
+        cudaMalloc((void **)&d_completed_nodes, 2 * sizeof(int));
+        cudaMalloc((void **)&d_path, 2 * MAX_PATH_SIZE * sizeof(float));
+        cudaMalloc((void **)&d_path_size, 2 * sizeof(int));
+        cudaMalloc((void **)&d_cost, sizeof(float));
+        cudaMalloc((void **)&d_reached_goal_idx, sizeof(int));
+        cudaMalloc((void **)&d_solved_iters, sizeof(int));
+
         // free index for next available position in tree_a and tree_b
         int h_free_index[2] = {1, num_goals};
-        cudaMemcpyToSymbol(atomic_free_index, &h_free_index, sizeof(int) * 2);
-        cudaMemcpyToSymbol(nodes_size, &h_free_index, sizeof(int) * 2);
+        cudaMemcpy((void *)d_atomic_free_index, h_free_index, sizeof(int) * 2, cudaMemcpyHostToDevice);
 
         // initialize completed_nodes counter
         int h_completed_nodes[2] = {1, num_goals}; // start and goals are already written
-        cudaMemcpyToSymbol(completed_nodes, &h_completed_nodes, sizeof(int) * 2);
+        cudaMemcpy((void *)d_completed_nodes, h_completed_nodes, sizeof(int) * 2, cudaMemcpyHostToDevice);
+
+        // Only these three need an explicit initial value: d_solved is read via a plain `!= 0`
+        // check regardless of outcome, d_cost is accumulated into (+=, not =) by the winning
+        // block, and d_solved_iters is read back on the host unconditionally even when the run
+        // doesn't solve. d_path/d_path_size/d_reached_goal_idx are only ever read on the host
+        // inside the `if (*h_solved)` branch below, and always fully written by the kernel in
+        // that case, so they need no initialization.
+        //
+        // d_solved must start at 0, not -1: the winning block's atomicCAS(d_solved, 0, 1) only
+        // succeeds when it finds exactly 0 (this mirrors the old global's own initial value,
+        // `__device__ volatile int solved = 0;`, and what reset_device_variables_kernel() reset
+        // it back to between calls) - -1 is the *host*-side pinned buffer's own "haven't read a
+        // value back yet" sentinel (see h_solved below), a different, unrelated -1.
+        int h_solved_init = 0;
+        float h_cost_init = 0.0f;
+        int h_solved_iters_init = 0;
+        cudaMemcpy((void *)d_solved, &h_solved_init, sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_cost, &h_cost_init, sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_solved_iters, &h_solved_iters_init, sizeof(int), cudaMemcpyHostToDevice);
 
         // Environment collision-checking now goes through the global SDF grids uploaded by
         // uploadSDFEnvironment() (see fanuc_m710_benchmark.cuh) rather than the cuboid list
@@ -1026,15 +1029,23 @@ namespace pRRTC
             d_parents,
             d_radii,
             halton_states,
-            rng_states);
+            rng_states,
+            d_solved,
+            d_atomic_free_index,
+            d_completed_nodes,
+            d_path,
+            d_path_size,
+            d_cost,
+            d_reached_goal_idx,
+            d_solved_iters);
         cudaDeviceSynchronize();
         res.kernel_ns = get_elapsed_nanoseconds(kernel_start_time);
 
         // get data from device
         copy_start_time = std::chrono::steady_clock::now();
-        cudaMemcpyFromSymbol(current_samples, atomic_free_index, sizeof(int) * 2, 0, cudaMemcpyDeviceToHost);
-        cudaMemcpyFromSymbol(h_solved, solved, sizeof(int), 0, cudaMemcpyDeviceToHost);
-        cudaMemcpyFromSymbol(&h_solved_iters, solved_iters, sizeof(int), 0, cudaMemcpyDeviceToHost);
+        cudaMemcpy(current_samples, (void *)d_atomic_free_index, sizeof(int) * 2, cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_solved, (void *)d_solved, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&h_solved_iters, d_solved_iters, sizeof(int), cudaMemcpyDeviceToHost);
         res.copy_ns += get_elapsed_nanoseconds(copy_start_time);
 
         cudaCheckError(cudaGetLastError());
@@ -1050,10 +1061,10 @@ namespace pRRTC
             float h_paths[2][MAX_PATH_SIZE];
             float h_cost;
             int h_reached_goal_idx;
-            cudaMemcpyFromSymbol(h_path_size, path_size, sizeof(int) * 2, 0, cudaMemcpyDeviceToHost);
-            cudaMemcpyFromSymbol(h_paths, path, sizeof(float) * 2 * MAX_PATH_SIZE, 0, cudaMemcpyDeviceToHost);
-            cudaMemcpyFromSymbol(&h_cost, cost, sizeof(float), 0, cudaMemcpyDeviceToHost);
-            cudaMemcpyFromSymbol(&h_reached_goal_idx, reached_goal_idx, sizeof(int), 0, cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_path_size, d_path_size, sizeof(int) * 2, cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_paths, d_path, sizeof(float) * 2 * MAX_PATH_SIZE, cudaMemcpyDeviceToHost);
+            cudaMemcpy(&h_cost, d_cost, sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(&h_reached_goal_idx, d_reached_goal_idx, sizeof(int), cudaMemcpyDeviceToHost);
             cudaCheckError(cudaGetLastError());
             res.path.emplace_back(goals[h_reached_goal_idx]);
             typename Robot::Configuration config;
@@ -1074,7 +1085,6 @@ namespace pRRTC
         res.solved = (*h_solved) != 0;
         res.iters = h_solved_iters;
 
-        reset_device_variables();
         cudaFree((void *)nodes[0]);
         cudaFree((void *)nodes[1]);
         cudaFree((void *)parents[0]);
@@ -1086,18 +1096,27 @@ namespace pRRTC
         cudaFree(d_nodes);
         cudaFree(d_parents);
         cudaFree(d_radii);
+        cudaFree((void *)d_solved);
+        cudaFree((void *)d_atomic_free_index);
+        cudaFree((void *)d_completed_nodes);
+        cudaFree(d_path);
+        cudaFree(d_path_size);
+        cudaFree(d_cost);
+        cudaFree(d_reached_goal_idx);
+        cudaFree(d_solved_iters);
         cudaFreeHost(h_solved);
         cudaCheckError(cudaGetLastError());
         res.wall_ns = get_elapsed_nanoseconds(start_time);
         // RSW-2740: removed the cudaDeviceReset() that used to sit here (measured at ~49-61ms
-        // per call standalone - see the RSW-2740 benchmarking notes). reset_device_variables()
-        // just above already explicitly zeroes every mutable __device__ global this function
-        // touches (solved, both atomic counters, path/path_size, cost, reached_goal_idx, and now
-        // solved_iters too - see that kernel's own comment), so a full context teardown+rebuild
-        // was redundant with it for correctness. The one thing cudaDeviceReset() additionally
-        // wiped - __constant__ memory (SDF grids, joint limits, settings) - is the caller's
-        // responsibility to upload before calling solve() in the first place; it no longer needs
-        // to be re-uploaded between calls now that nothing wipes it out from under the caller.
+        // per call standalone - see the RSW-2740 benchmarking notes). The nine bookkeeping
+        // values it needed reset between calls (solved, both atomic counters, path/path_size,
+        // cost, reached_goal_idx, solved_iters) are no longer __device__ globals at all - each
+        // is a fresh cudaMalloc'd buffer per call (see above), so there's nothing left to reset,
+        // and each solve() call is now independently reentrant. The one thing cudaDeviceReset()
+        // additionally wiped - __constant__ memory (SDF grids, joint limits, settings) - is the
+        // caller's responsibility to upload before calling solve() in the first place; it no
+        // longer needs to be re-uploaded between calls now that nothing wipes it out from under
+        // the caller.
         return res;
     }
 

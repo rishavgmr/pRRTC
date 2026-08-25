@@ -106,3 +106,31 @@ target_compile_options(benchmark_fanuc_m710 PRIVATE
     -Wno-c++11-narrowing
     $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
 )
+
+### RSW-2740 Phase 3: batch orchestrator - solves a whole batch of (start, goal) pairs from a
+### case's problems_batch.json concurrently (one thread per pair), superseding the earlier
+### throwaway prrtc_reentrant_test (same underlying mechanism, now with real reporting).
+add_executable(benchmark_fanuc_m710_batch
+    scripts/benchmark_fanuc_m710_batch.cpp
+    src/planning/pRRTC_benchmark.cu
+)
+
+target_include_directories(benchmark_fanuc_m710_batch
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/build/_deps/nigh-src/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/build/_deps/pdqsort-src
+)
+
+target_link_libraries(benchmark_fanuc_m710_batch
+    PRIVATE
+    nlohmann_json::nlohmann_json
+    Eigen3::Eigen
+    CUDA::cudart
+    Threads::Threads
+)
+
+target_compile_options(benchmark_fanuc_m710_batch PRIVATE
+    -Wno-c++11-narrowing
+    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
+)
