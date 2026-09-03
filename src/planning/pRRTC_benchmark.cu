@@ -18,6 +18,8 @@
 #include <cassert>
 #include <stdexcept>
 #include <algorithm>
+#include <memory>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <cmath>
@@ -894,6 +896,344 @@ namespace pRRTC
         }
     }
 
+    // RSW-2740: one reusable set of device allocations for a single in-flight solve() or
+    // shortcutPath() call. Borrowed from SolveBufferPool below, never owned by a thread directly.
+    //
+    // Every solve() call used to cudaMalloc and cudaFree its full working set (12 cudaMalloc /
+    // 21 cudaFree per call). Measured on the collins 78-problem batch that was ~90% of total
+    // planning time, against 9.3% for the actual rrtc() kernel - i.e. pRRTC's GPU search was
+    // never the bottleneck, the allocator was. Under concurrency it is worse than a constant
+    // factor, since cudaMalloc/cudaFree serialize on a driver-global lock.
+    //
+    // Exactly one thread uses a given instance at a time, guaranteed by the lease that hands it
+    // out, so nothing in here needs its own synchronization - solve() stays independently
+    // reentrant, which was the point of the earlier Phase 2 work that moved this state off
+    // __device__ globals. Sizes are keyed on (max_samples, num_new_configs) and only reallocated
+    // when a caller asks for different ones.
+    //
+    // What is deliberately NOT cached is the per-solve *initialization*: init_rng/init_halton
+    // still run every call (cheap kernels - the cudaMalloc was the expensive part, not the init),
+    // so each solve draws the same Halton sequence it always did and results stay bit-identical
+    // to the pre-caching behaviour rather than silently continuing a previous solve's sequence.
+    template <typename Robot>
+    struct SolveBuffers
+    {
+        static constexpr auto dim = Robot::dimension;
+
+        int max_samples = 0;
+        int num_new_configs = 0;
+
+        float *nodes[2] = {nullptr, nullptr};
+        int *parents[2] = {nullptr, nullptr};
+        float *radii[2] = {nullptr, nullptr};
+        float **d_nodes = nullptr;
+        int **d_parents = nullptr;
+        float **d_radii = nullptr;
+        curandState *rng_states = nullptr;
+        HaltonState<Robot> *halton_states = nullptr;
+        volatile int *d_solved = nullptr;
+        volatile int *d_atomic_free_index = nullptr;
+        volatile int *d_completed_nodes = nullptr;
+        float (*d_path)[MAX_PATH_SIZE] = nullptr;
+        int *d_path_size = nullptr;
+        float *d_cost = nullptr;
+        int *d_reached_goal_idx = nullptr;
+        int *d_solved_iters = nullptr;
+        int *h_solved = nullptr;
+
+        // RSW-2740: this thread's own CUDA stream. Everything solve() and shortcutPath() submit
+        // goes here rather than the legacy default stream, which is process-wide and shared by
+        // every thread - that is what made the "concurrent" batch pass slower than the serial one
+        // (78 threads' kernels serialized on one stream, and each thread's cudaDeviceSynchronize()
+        // additionally waited for every OTHER thread's kernels, since it is a device-wide
+        // barrier). Created lazily with the rest of the pool and destroyed with it.
+        //
+        // NOT created with cudaStreamCreate's default flags: cudaStreamNonBlocking stops this
+        // stream from implicitly synchronizing against the legacy default stream, which is the
+        // whole point - a default-flags stream still serializes against any legacy-stream work
+        // anywhere else in the process.
+        cudaStream_t stream = nullptr;
+
+        // shortcutPath()'s working set, pooled for the same reason and on the same stream. It
+        // used to cudaMalloc/cudaFree d_path once per refinement round inside its own loop, on
+        // top of three per-call allocations. Sized grow-only: sc_path_capacity_floats tracks the
+        // largest path this thread has ever shortcut, and current_path only ever shrinks within a
+        // call, so the initial path length is a safe upper bound for the whole call.
+        int *sc_id1 = nullptr;
+        int *sc_id2 = nullptr;
+        int *sc_invalid = nullptr;
+        int sc_candidates = 0;
+        float *sc_path = nullptr;
+        int sc_path_capacity_floats = 0;
+
+        SolveBuffers() = default;
+        SolveBuffers(const SolveBuffers &) = delete;
+        SolveBuffers &operator=(const SolveBuffers &) = delete;
+
+        ~SolveBuffers()
+        {
+            release();
+            // Swallow any error from freeing during process/thread teardown (the CUDA context
+            // may already be gone by the time a thread_local destructor runs) - there is nothing
+            // useful to do about it here, and letting it leak into the next
+            // cudaCheckError(cudaGetLastError()) on another thread would be actively misleading.
+            cudaGetLastError();
+        }
+
+        // Frees everything this thread owns. cudaFree(nullptr) is a documented no-op, so this is
+        // safe to call on a partially-populated pool - which matters now that the stream and the
+        // shortcut buffers have lifetimes independent of the solve() buffers (shortcutPath() can
+        // legitimately be called without solve() ever having run on this thread).
+        void release()
+        {
+            releaseShortcut();
+            releaseSolve();
+            if (stream != nullptr)
+            {
+                cudaStreamDestroy(stream);
+                stream = nullptr;
+            }
+        }
+
+        // Just the solve() working set - ensure() uses this so that a settings change does not
+        // tear down the stream or the shortcut buffers along with it.
+        void releaseSolve()
+        {
+            cudaFree((void *)nodes[0]);
+            cudaFree((void *)nodes[1]);
+            cudaFree((void *)parents[0]);
+            cudaFree((void *)parents[1]);
+            cudaFree((void *)radii[0]);
+            cudaFree((void *)radii[1]);
+            cudaFree(rng_states);
+            cudaFree(halton_states);
+            cudaFree(d_nodes);
+            cudaFree(d_parents);
+            cudaFree(d_radii);
+            cudaFree((void *)d_solved);
+            cudaFree((void *)d_atomic_free_index);
+            cudaFree((void *)d_completed_nodes);
+            cudaFree(d_path);
+            cudaFree(d_path_size);
+            cudaFree(d_cost);
+            cudaFree(d_reached_goal_idx);
+            cudaFree(d_solved_iters);
+            cudaFreeHost(h_solved);
+
+            nodes[0] = nodes[1] = nullptr;
+            parents[0] = parents[1] = nullptr;
+            radii[0] = radii[1] = nullptr;
+            d_nodes = nullptr;
+            d_parents = nullptr;
+            d_radii = nullptr;
+            rng_states = nullptr;
+            halton_states = nullptr;
+            d_solved = nullptr;
+            d_atomic_free_index = nullptr;
+            d_completed_nodes = nullptr;
+            d_path = nullptr;
+            d_path_size = nullptr;
+            d_cost = nullptr;
+            d_reached_goal_idx = nullptr;
+            d_solved_iters = nullptr;
+            h_solved = nullptr;
+            max_samples = 0;
+            num_new_configs = 0;
+        }
+
+        void releaseShortcut()
+        {
+            cudaFree(sc_id1);
+            cudaFree(sc_id2);
+            cudaFree(sc_invalid);
+            cudaFree(sc_path);
+            sc_id1 = nullptr;
+            sc_id2 = nullptr;
+            sc_invalid = nullptr;
+            sc_path = nullptr;
+            sc_candidates = 0;
+            sc_path_capacity_floats = 0;
+        }
+
+        // Creates this thread's stream on first use. Separate from ensure() because
+        // shortcutPath() needs the stream too but has no interest in the solve() buffers.
+        cudaStream_t ensureStream()
+        {
+            if (stream == nullptr)
+            {
+                cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+            }
+            return stream;
+        }
+
+        // Grow-only sizing for shortcutPath()'s buffers - reallocates only when this thread meets
+        // a bigger path or candidate count than it ever has before, so a batch of similar-sized
+        // paths allocates once.
+        //
+        // Growth is GEOMETRIC (2x the request, with a floor), not exact, and that matters a lot
+        // here: shortcutPath's path length grows every round, so exact sizing reallocated on every
+        // single round, and cudaFree implicitly synchronizes the whole device. Under 78-way
+        // concurrency that turned into a storm of device-wide syncs that dominated the concurrent
+        // pass (measured: 50.7% of per-problem time, ~48ms each, versus 0.5ms serial). Doubling
+        // means a thread reallocates a couple of times and then never again.
+        void ensureShortcut(int requested_candidates, int requested_path_floats)
+        {
+            if (sc_candidates >= requested_candidates && sc_path_capacity_floats >= requested_path_floats)
+            {
+                return;
+            }
+            releaseShortcut();
+
+            // Floor keeps the very first (usually tiny) path from seeding a buffer that then has
+            // to grow again immediately on the next round.
+            constexpr int kMinPathFloats = 16384;
+            const int candidates = std::max(requested_candidates, 2 * sc_candidates);
+            const int path_floats = std::max({requested_path_floats * 2, sc_path_capacity_floats * 2, kMinPathFloats});
+
+            cudaMalloc(&sc_id1, candidates * sizeof(int));
+            cudaMalloc(&sc_id2, candidates * sizeof(int));
+            cudaMalloc(&sc_invalid, candidates * sizeof(int));
+            cudaMalloc(&sc_path, path_floats * sizeof(float));
+            sc_candidates = candidates;
+            sc_path_capacity_floats = path_floats;
+        }
+
+        // Allocates (or reallocates, on a settings change) everything solve() needs. No-op on
+        // the common path where the previous call used the same sizes.
+        void ensure(int requested_max_samples, int requested_num_new_configs)
+        {
+            if (max_samples == requested_max_samples && num_new_configs == requested_num_new_configs)
+            {
+                return;
+            }
+            // Deliberately not release() - that would also destroy the stream and the shortcut
+            // buffers, neither of which depends on these two sizes.
+            releaseSolve();
+
+            const std::size_t config_size = dim * sizeof(float);
+            for (int i = 0; i < 2; i++)
+            {
+                cudaMalloc(&nodes[i], requested_max_samples * config_size);
+                cudaMalloc(&parents[i], requested_max_samples * sizeof(int));
+                cudaMalloc(&radii[i], requested_max_samples * sizeof(float));
+            }
+            cudaMalloc(&d_nodes, 2 * sizeof(float *));
+            cudaMalloc(&d_parents, 2 * sizeof(int *));
+            cudaMalloc(&d_radii, 2 * sizeof(float *));
+            // Synchronous on purpose: this runs once per settings change, not per solve, and the
+            // pointers must be visible on the device before any stream work references them.
+            cudaMemcpy(d_nodes, nodes, 2 * sizeof(float *), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_parents, parents, 2 * sizeof(int *), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_radii, radii, 2 * sizeof(float *), cudaMemcpyHostToDevice);
+
+            cudaMalloc(&rng_states, requested_num_new_configs * dim * sizeof(curandState));
+            cudaMalloc(&halton_states, requested_num_new_configs * sizeof(HaltonState<Robot>));
+
+            cudaMalloc((void **)&d_solved, sizeof(int));
+            cudaMalloc((void **)&d_atomic_free_index, 2 * sizeof(int));
+            cudaMalloc((void **)&d_completed_nodes, 2 * sizeof(int));
+            cudaMalloc((void **)&d_path, 2 * MAX_PATH_SIZE * sizeof(float));
+            cudaMalloc((void **)&d_path_size, 2 * sizeof(int));
+            cudaMalloc((void **)&d_cost, sizeof(float));
+            cudaMalloc((void **)&d_reached_goal_idx, sizeof(int));
+            cudaMalloc((void **)&d_solved_iters, sizeof(int));
+            cudaMallocHost(&h_solved, sizeof(int));
+
+            max_samples = requested_max_samples;
+            num_new_configs = requested_num_new_configs;
+        }
+    };
+
+    // RSW-2740: process-wide pool of SolveBuffers, borrowed and returned around each solve() /
+    // shortcutPath() call, replacing what used to be a thread_local instance.
+    //
+    // Why this and not thread_local: with thread_local, a buffer set is only warm from the SECOND
+    // call onward on that same thread. That is a good fit for the serial benchmark pass (one
+    // allocation, 77 reuses) and a terrible one for how this code is actually used - the
+    // concurrent pass gives each thread exactly one problem, and production's
+    // TrajectoryHdlr::planJumpTrajectory() likewise spawns a fresh std::thread per jump. So every
+    // thread paid a cold start (12 cudaMalloc plus a stream creation, all serializing on the
+    // driver's allocation lock), which measured at ~64ms per problem against ~1.2ms of real work.
+    // Pooling across threads means the Nth short-lived thread borrows buffers some earlier thread
+    // already warmed.
+    //
+    // The mutex protects ONLY the free-list vector - never a CUDA call. Allocation still happens
+    // lazily inside ensure()/ensureStream(), outside the lock, so borrowing never serializes
+    // cudaMalloc. A default-constructed SolveBuffers is all-nullptr and costs nothing, so the
+    // pool-miss path is also lock-free past the pop attempt.
+    //
+    // The pool grows to peak concurrency and never shrinks, which is self-limiting: at
+    // max_samples=20000 each entry is roughly 1.5MB of device memory, so even 78 concurrent
+    // solves is ~120MB.
+    template <typename Robot>
+    class SolveBufferPool
+    {
+       public:
+        static SolveBufferPool &instance()
+        {
+            static SolveBufferPool pool;
+            return pool;
+        }
+
+        std::unique_ptr<SolveBuffers<Robot>> acquire()
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!free_list_.empty())
+                {
+                    std::unique_ptr<SolveBuffers<Robot>> buffers = std::move(free_list_.back());
+                    free_list_.pop_back();
+                    return buffers;
+                }
+            }
+            return std::make_unique<SolveBuffers<Robot>>();
+        }
+
+        void release(std::unique_ptr<SolveBuffers<Robot>> buffers)
+        {
+            if (buffers == nullptr)
+            {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(mutex_);
+            free_list_.push_back(std::move(buffers));
+        }
+
+       private:
+        SolveBufferPool() = default;
+
+        std::mutex mutex_;
+        std::vector<std::unique_ptr<SolveBuffers<Robot>>> free_list_;
+    };
+
+    // RAII lease so an early return or a throw between acquire and release cannot lose a buffer
+    // set back to the allocator.
+    //
+    // Safe to hand a buffer set straight back to another thread on release: every solve() path
+    // cudaStreamSynchronize()s before returning, and shortcutPath() synchronizes at the end of
+    // each round, so there is never device work still in flight against these buffers when the
+    // lease ends. Results have already been copied into host memory by then.
+    template <typename Robot>
+    class SolveBufferLease
+    {
+       public:
+        SolveBufferLease() : buffers_(SolveBufferPool<Robot>::instance().acquire()) {}
+
+        ~SolveBufferLease()
+        {
+            SolveBufferPool<Robot>::instance().release(std::move(buffers_));
+        }
+
+        SolveBufferLease(const SolveBufferLease &) = delete;
+        SolveBufferLease &operator=(const SolveBufferLease &) = delete;
+
+        SolveBuffers<Robot> &operator*() const { return *buffers_; }
+        SolveBuffers<Robot> *operator->() const { return buffers_.get(); }
+
+       private:
+        std::unique_ptr<SolveBuffers<Robot>> buffers_;
+    };
+
     template <typename Robot>
     PlannerResult<Robot> solve(
         typename Robot::Configuration &start,
@@ -906,79 +1246,73 @@ namespace pRRTC
         std::size_t start_index = 0;
         PlannerResult<Robot> res;
 
-        // copy data to GPU
-        cudaMemcpyToSymbol(d_settings, &settings, sizeof(settings));
+        // RSW-2740: d_settings is NOT uploaded here any more - it is a process-wide __constant__
+        // and writing it per call raced once solves stopped being serialized by the legacy
+        // default stream (thread A's write could land between thread B's write and B's kernel).
+        // uploadSettings() is now the caller's responsibility, once, alongside
+        // uploadSDFEnvironment()/uploadJointLimits(); see its comment for the constraint that
+        // implies for concurrent callers.
         int num_goals = goals.size();
-        float *nodes[2];
-        int *parents[2];
-        float *radii[2];
-        float **d_nodes;
-        int **d_parents;
-        float **d_radii;
-        cudaMalloc(&d_nodes, 2 * sizeof(float *));
-        cudaMalloc(&d_parents, 2 * sizeof(int *));
-        cudaMalloc(&d_radii, 2 * sizeof(float *));
         const std::size_t config_size = dim * sizeof(float);
 
-        for (int i = 0; i < 2; i++)
-        {
-            cudaMalloc(&nodes[i], settings.max_samples * config_size);
-            cudaMalloc(&parents[i], settings.max_samples * sizeof(int));
-            cudaMalloc(&radii[i], settings.max_samples * sizeof(float));
-        }
-        cudaMemcpy(d_nodes, nodes, 2 * sizeof(float *), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_parents, parents, 2 * sizeof(int *), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_radii, radii, 2 * sizeof(float *), cudaMemcpyHostToDevice);
+        // RSW-2740: allocations are now reused across calls on this thread - see SolveBuffers.
+        // Everything below still initializes its own state per call exactly as before; only the
+        // cudaMalloc/cudaFree traffic is gone.
+        SolveBufferLease<Robot> lease;
+        SolveBuffers<Robot> &buffers = *lease;
+        buffers.ensure(settings.max_samples, settings.num_new_configs);
+        cudaStream_t const stream = buffers.ensureStream();
 
-        // set nodes to unitialized
-        std::vector<float> nodes_init(settings.max_samples * dim, UNWRITTEN_VAL);
-        cudaMemcpy((void *)nodes[0], nodes_init.data(), config_size * settings.max_samples, cudaMemcpyHostToDevice);
-        cudaMemcpy((void *)nodes[1], nodes_init.data(), config_size * settings.max_samples, cudaMemcpyHostToDevice);
+        float **const nodes = buffers.nodes;
+        int **const parents = buffers.parents;
+        float **const radii = buffers.radii;
+        float **const d_nodes = buffers.d_nodes;
+        int **const d_parents = buffers.d_parents;
+        float **const d_radii = buffers.d_radii;
+        curandState *const rng_states = buffers.rng_states;
+        HaltonState<Robot> *const halton_states = buffers.halton_states;
+        volatile int *const d_solved = buffers.d_solved;
+        volatile int *const d_atomic_free_index = buffers.d_atomic_free_index;
+        volatile int *const d_completed_nodes = buffers.d_completed_nodes;
+        float (*const d_path)[MAX_PATH_SIZE] = buffers.d_path;
+        int *const d_path_size = buffers.d_path_size;
+        float *const d_cost = buffers.d_cost;
+        int *const d_reached_goal_idx = buffers.d_reached_goal_idx;
+        int *const d_solved_iters = buffers.d_solved_iters;
+
+        // RSW-2740: the "set nodes to uninitialized" pass that used to sit here (a
+        // std::vector<float>(max_samples * dim, UNWRITTEN_VAL) host fill plus two full-array
+        // H2D memcpys - 56MB per call at the old max_samples default) is gone, because nothing
+        // ever read what it wrote. UNWRITTEN_VAL is only otherwise written by
+        // reset_to_unwritten_state(), whose every call site is commented out, and both
+        // nearest-neighbour scans are strictly bounded by
+        // min(d_atomic_free_index[t], d_completed_nodes[t]), so no block can reach an entry that
+        // has not already been written by the node that claimed it. Removing it is also what
+        // makes buffer reuse safe without a re-clear: every node's coordinates, parent and
+        // radius are written at the moment its slot is claimed (radii[t][index] = FLT_MAX), and
+        // the start/goal entries are explicitly re-written below on every call.
 
         // initialize radii
         std::vector<float> radii_init(num_goals, FLT_MAX);
-        cudaMemcpy((void *)radii[0], radii_init.data(), sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy((void *)radii[1], radii_init.data(), sizeof(float) * num_goals, cudaMemcpyHostToDevice);
+        cudaMemcpyAsync((void *)radii[0], radii_init.data(), sizeof(float), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync((void *)radii[1], radii_init.data(), sizeof(float) * num_goals, cudaMemcpyHostToDevice, stream);
 
-        // create a curandState for each thread
-        curandState *rng_states;
+        // Re-seeded every call even though the allocation is reused, so each solve() draws the
+        // same Halton sequence it would have drawn before this caching existed.
         int num_rng_states = settings.num_new_configs * dim;
-        cudaMalloc(&rng_states, num_rng_states * sizeof(curandState));
         int numBlocks = (num_rng_states + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        init_rng<<<numBlocks, BLOCK_SIZE>>>(rng_states, 1, num_rng_states);
+        init_rng<<<numBlocks, BLOCK_SIZE, 0, stream>>>(rng_states, 1, num_rng_states);
 
-        HaltonState<Robot> *halton_states;
-        cudaMalloc(&halton_states, settings.num_new_configs * sizeof(HaltonState<Robot>));
         int numBlocks1 = (settings.num_new_configs + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        init_halton<Robot><<<numBlocks1, BLOCK_SIZE>>>(halton_states, rng_states);
-
-        // RSW-2740: per-call reentrant state - was __device__ globals shared across calls
-        // (reset between calls via reset_device_variables_kernel()), now cudaMalloc'd fresh
-        // here and cudaFree'd at the end of this function, matching nodes/parents/radii above.
-        volatile int *d_solved;
-        volatile int *d_atomic_free_index;
-        volatile int *d_completed_nodes;
-        float (*d_path)[MAX_PATH_SIZE];
-        int *d_path_size;
-        float *d_cost;
-        int *d_reached_goal_idx;
-        int *d_solved_iters;
-        cudaMalloc((void **)&d_solved, sizeof(int));
-        cudaMalloc((void **)&d_atomic_free_index, 2 * sizeof(int));
-        cudaMalloc((void **)&d_completed_nodes, 2 * sizeof(int));
-        cudaMalloc((void **)&d_path, 2 * MAX_PATH_SIZE * sizeof(float));
-        cudaMalloc((void **)&d_path_size, 2 * sizeof(int));
-        cudaMalloc((void **)&d_cost, sizeof(float));
-        cudaMalloc((void **)&d_reached_goal_idx, sizeof(int));
-        cudaMalloc((void **)&d_solved_iters, sizeof(int));
+        init_halton<Robot><<<numBlocks1, BLOCK_SIZE, 0, stream>>>(halton_states, rng_states);
 
         // free index for next available position in tree_a and tree_b
         int h_free_index[2] = {1, num_goals};
-        cudaMemcpy((void *)d_atomic_free_index, h_free_index, sizeof(int) * 2, cudaMemcpyHostToDevice);
+        cudaMemcpyAsync((void *)d_atomic_free_index, h_free_index, sizeof(int) * 2, cudaMemcpyHostToDevice, stream);
 
         // initialize completed_nodes counter
         int h_completed_nodes[2] = {1, num_goals}; // start and goals are already written
-        cudaMemcpy((void *)d_completed_nodes, h_completed_nodes, sizeof(int) * 2, cudaMemcpyHostToDevice);
+        cudaMemcpyAsync((void *)d_completed_nodes, h_completed_nodes, sizeof(int) * 2, cudaMemcpyHostToDevice, stream);
 
         // Only these three need an explicit initial value: d_solved is read via a plain `!= 0`
         // check regardless of outcome, d_cost is accumulated into (+=, not =) by the winning
@@ -995,9 +1329,9 @@ namespace pRRTC
         int h_solved_init = 0;
         float h_cost_init = 0.0f;
         int h_solved_iters_init = 0;
-        cudaMemcpy((void *)d_solved, &h_solved_init, sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_cost, &h_cost_init, sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_solved_iters, &h_solved_iters_init, sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpyAsync((void *)d_solved, &h_solved_init, sizeof(int), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(d_cost, &h_cost_init, sizeof(float), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(d_solved_iters, &h_solved_iters_init, sizeof(int), cudaMemcpyHostToDevice, stream);
 
         // Environment collision-checking now goes through the global SDF grids uploaded by
         // uploadSDFEnvironment() (see fanuc_m710_benchmark.cuh) rather than the cuboid list
@@ -1005,26 +1339,29 @@ namespace pRRTC
         // is fixed by the shared Planners.hh declaration) but no longer uploaded or used here.
         cudaCheckError(cudaGetLastError());
 
-        // Setup pinned memory for signaling
-        int *h_solved;
+        // Setup pinned memory for signaling (allocation reused across calls, value reset here)
+        int *const h_solved = buffers.h_solved;
         int current_samples[2];
         int h_solved_iters = -1;
-        cudaMallocHost(&h_solved, sizeof(int));
         *h_solved = -1;
 
         auto copy_start_time = std::chrono::steady_clock::now();
         // add start to tree_a and goals to tree_b
-        cudaMemcpy((void *)nodes[0], start.data(), config_size, cudaMemcpyHostToDevice);
-        cudaMemcpy((void *)parents[0], &start_index, sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpyAsync((void *)nodes[0], start.data(), config_size, cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync((void *)parents[0], &start_index, sizeof(int), cudaMemcpyHostToDevice, stream);
 
-        cudaMemcpy((void *)nodes[1], goals.data(), config_size * num_goals, cudaMemcpyHostToDevice);
+        cudaMemcpyAsync((void *)nodes[1], goals.data(), config_size * num_goals, cudaMemcpyHostToDevice, stream);
         std::vector<int> parents_b_init(num_goals);
         iota(parents_b_init.begin(), parents_b_init.end(), 0); // consecutive integers from 0 ... num_goals - 1
-        cudaMemcpy((void *)parents[1], parents_b_init.data(), sizeof(int) * num_goals, cudaMemcpyHostToDevice);
+        cudaMemcpyAsync((void *)parents[1], parents_b_init.data(), sizeof(int) * num_goals, cudaMemcpyHostToDevice, stream);
+        // Sync here rather than letting these ride into the kernel launch: every source above is
+        // pageable host memory (stack scalars, std::vector) that goes out of scope at the end of
+        // this function, and this also keeps copy_ns measuring the copies rather than the kernel.
+        cudaStreamSynchronize(stream);
         res.copy_ns = get_elapsed_nanoseconds(copy_start_time);
 
         auto kernel_start_time = std::chrono::steady_clock::now();
-        rrtc<Robot><<<settings.num_new_configs, 4 * settings.granularity>>>(
+        rrtc<Robot><<<settings.num_new_configs, 4 * settings.granularity, 0, stream>>>(
             d_nodes,
             d_parents,
             d_radii,
@@ -1038,14 +1375,19 @@ namespace pRRTC
             d_cost,
             d_reached_goal_idx,
             d_solved_iters);
-        cudaDeviceSynchronize();
+        // RSW-2740: cudaStreamSynchronize, NOT cudaDeviceSynchronize. The latter is a device-wide
+        // barrier, so with N threads in flight every thread waited for every other thread's
+        // kernels - which is why the concurrent batch pass measured slower than the serial one
+        // even after the allocation overhead was removed.
+        cudaStreamSynchronize(stream);
         res.kernel_ns = get_elapsed_nanoseconds(kernel_start_time);
 
         // get data from device
         copy_start_time = std::chrono::steady_clock::now();
-        cudaMemcpy(current_samples, (void *)d_atomic_free_index, sizeof(int) * 2, cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_solved, (void *)d_solved, sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&h_solved_iters, d_solved_iters, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(current_samples, (void *)d_atomic_free_index, sizeof(int) * 2, cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(h_solved, (void *)d_solved, sizeof(int), cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(&h_solved_iters, d_solved_iters, sizeof(int), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
         res.copy_ns += get_elapsed_nanoseconds(copy_start_time);
 
         cudaCheckError(cudaGetLastError());
@@ -1061,10 +1403,11 @@ namespace pRRTC
             float h_paths[2][MAX_PATH_SIZE];
             float h_cost;
             int h_reached_goal_idx;
-            cudaMemcpy(h_path_size, d_path_size, sizeof(int) * 2, cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_paths, d_path, sizeof(float) * 2 * MAX_PATH_SIZE, cudaMemcpyDeviceToHost);
-            cudaMemcpy(&h_cost, d_cost, sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(&h_reached_goal_idx, d_reached_goal_idx, sizeof(int), cudaMemcpyDeviceToHost);
+            cudaMemcpyAsync(h_path_size, d_path_size, sizeof(int) * 2, cudaMemcpyDeviceToHost, stream);
+            cudaMemcpyAsync(h_paths, d_path, sizeof(float) * 2 * MAX_PATH_SIZE, cudaMemcpyDeviceToHost, stream);
+            cudaMemcpyAsync(&h_cost, d_cost, sizeof(float), cudaMemcpyDeviceToHost, stream);
+            cudaMemcpyAsync(&h_reached_goal_idx, d_reached_goal_idx, sizeof(int), cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
             cudaCheckError(cudaGetLastError());
             res.path.emplace_back(goals[h_reached_goal_idx]);
             typename Robot::Configuration config;
@@ -1085,26 +1428,10 @@ namespace pRRTC
         res.solved = (*h_solved) != 0;
         res.iters = h_solved_iters;
 
-        cudaFree((void *)nodes[0]);
-        cudaFree((void *)nodes[1]);
-        cudaFree((void *)parents[0]);
-        cudaFree((void *)parents[1]);
-        cudaFree((void *)radii[0]);
-        cudaFree((void *)radii[1]);
-        cudaFree(rng_states);
-        cudaFree(halton_states);
-        cudaFree(d_nodes);
-        cudaFree(d_parents);
-        cudaFree(d_radii);
-        cudaFree((void *)d_solved);
-        cudaFree((void *)d_atomic_free_index);
-        cudaFree((void *)d_completed_nodes);
-        cudaFree(d_path);
-        cudaFree(d_path_size);
-        cudaFree(d_cost);
-        cudaFree(d_reached_goal_idx);
-        cudaFree(d_solved_iters);
-        cudaFreeHost(h_solved);
+        // RSW-2740: no cudaFree block here any more - every buffer above belongs to this
+        // thread's SolveBuffers pool and is reused by the next solve() call on this thread,
+        // released only when the thread itself exits (see SolveBuffers::~SolveBuffers). This is
+        // the change that removed ~90% of measured per-solve time on the collins batch.
         cudaCheckError(cudaGetLastError());
         res.wall_ns = get_elapsed_nanoseconds(start_time);
         // RSW-2740: removed the cudaDeviceReset() that used to sit here (measured at ~49-61ms
@@ -1596,6 +1923,11 @@ namespace pRRTC
         cudaMemcpyToSymbol(ppln::robots::fanucm710_dof_s_m, s_m, sizeof(s_m));
     }
 
+    void uploadSettings(const pRRTC_settings &settings)
+    {
+        cudaMemcpyToSymbol(d_settings, &settings, sizeof(settings));
+    }
+
     template <typename Robot>
     std::vector<typename Robot::Configuration> shortcutPath(
         const std::vector<typename Robot::Configuration> &path,
@@ -1646,10 +1978,20 @@ namespace pRRTC
         auto seed = std::chrono::system_clock::now().time_since_epoch().count();
         std::mt19937 generator(seed);
 
-        int *d_id1, *d_id2, *d_invalid;
-        cudaMalloc(&d_id1, kCandidatesPerRound * sizeof(int));
-        cudaMalloc(&d_id2, kCandidatesPerRound * sizeof(int));
-        cudaMalloc(&d_invalid, kCandidatesPerRound * sizeof(int));
+        // RSW-2740: pooled per-thread and submitted on this thread's own stream, same as solve().
+        // d_path in particular used to be cudaMalloc'd and cudaFree'd once per refinement round
+        // inside the loop below.
+        //
+        // Sizing is done per round rather than once up front, because current_path can GROW: a
+        // selected shortcut replaces the segment [id1, id2] with n_steps = ceil(dist/range) *
+        // granularity interpolated waypoints, which for granularity 16 is easily more points than
+        // it removed. Sizing off the initial path.size() therefore under-allocates, which is
+        // exactly what it did - compute-sanitizer caught validate_candidates_kernel reading past
+        // the end of sc_path. ensureShortcut() is grow-only, so this settles after the first
+        // couple of rounds rather than reallocating every time.
+        SolveBufferLease<Robot> lease;
+        SolveBuffers<Robot> &buffers = *lease;
+        cudaStream_t const stream = buffers.ensureStream();
 
         std::vector<int> h_id1(kCandidatesPerRound), h_id2(kCandidatesPerRound), h_invalid(kCandidatesPerRound);
 
@@ -1674,9 +2016,15 @@ namespace pRRTC
                     h_flat[i * dim + j] = current_path[i][j];
                 }
             }
-            float *d_path;
-            cudaMalloc(&d_path, n * dim * sizeof(float));
-            cudaMemcpy(d_path, h_flat.data(), n * dim * sizeof(float), cudaMemcpyHostToDevice);
+            // Must run before the pointers are read below: a grow reallocates, so caching them
+            // outside the loop would leave them dangling the moment the path gets longer.
+            buffers.ensureShortcut(kCandidatesPerRound, n * dim);
+            int *const d_id1 = buffers.sc_id1;
+            int *const d_id2 = buffers.sc_id2;
+            int *const d_invalid = buffers.sc_invalid;
+            float *const d_path = buffers.sc_path;
+
+            cudaMemcpyAsync(d_path, h_flat.data(), n * dim * sizeof(float), cudaMemcpyHostToDevice, stream);
 
             std::uniform_int_distribution<int> unid(0, n - 1);
             for (int k = 0; k < kCandidatesPerRound; k++)
@@ -1694,16 +2042,18 @@ namespace pRRTC
                 h_id1[k] = i1;
                 h_id2[k] = i2;
             }
-            cudaMemcpy(d_id1, h_id1.data(), kCandidatesPerRound * sizeof(int), cudaMemcpyHostToDevice);
-            cudaMemcpy(d_id2, h_id2.data(), kCandidatesPerRound * sizeof(int), cudaMemcpyHostToDevice);
-            cudaMemset(d_invalid, 0, kCandidatesPerRound * sizeof(int));
+            cudaMemcpyAsync(d_id1, h_id1.data(), kCandidatesPerRound * sizeof(int), cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(d_id2, h_id2.data(), kCandidatesPerRound * sizeof(int), cudaMemcpyHostToDevice, stream);
+            cudaMemsetAsync(d_invalid, 0, kCandidatesPerRound * sizeof(int), stream);
 
             const int total_blocks = kCandidatesPerRound * max_chunks_per_candidate;
-            validate_candidates_kernel<Robot><<<total_blocks, 4 * granularity>>>(
+            validate_candidates_kernel<Robot><<<total_blocks, 4 * granularity, 0, stream>>>(
                 d_path, d_id1, d_id2, max_chunks_per_candidate, range, granularity, d_invalid);
 
-            cudaMemcpy(h_invalid.data(), d_invalid, kCandidatesPerRound * sizeof(int), cudaMemcpyDeviceToHost);
-            cudaFree(d_path);
+            cudaMemcpyAsync(h_invalid.data(), d_invalid, kCandidatesPerRound * sizeof(int), cudaMemcpyDeviceToHost, stream);
+            // h_invalid is read immediately below, and h_flat/h_id1/h_id2 are rewritten by the
+            // next round, so this round's stream work must be complete before either happens.
+            cudaStreamSynchronize(stream);
 
             // Cost comparison only needs the local segment being replaced (see the single-
             // candidate version's reasoning, unchanged) - cheap, plain host arithmetic.
@@ -1801,9 +2151,8 @@ namespace pRRTC
             current_path = std::move(new_path);
         }
 
-        cudaFree(d_id1);
-        cudaFree(d_id2);
-        cudaFree(d_invalid);
+        // RSW-2740: no cudaFree here - d_id1/d_id2/d_invalid/d_path belong to this thread's
+        // SolveBuffers pool and are reused by the next shortcutPath() call on this thread.
         return current_path;
     }
 

@@ -127,6 +127,8 @@ void uploadRobotOverrides(
     const Mat3Host &frames1_rotation
 );
 
+void uploadSettings(const pRRTC_settings &settings);
+
 // Uploads the 7 (lower, upper) bounds that Fanucm710::scale_cfg() maps every random Halton
 // sample into before EXTEND ever uses it (RSW-2740) - i.e. the region solve()'s random sampling
 // can ever place a node in, regardless of iterations or range. These are case-specific (mirrors

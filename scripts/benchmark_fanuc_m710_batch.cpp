@@ -561,8 +561,17 @@ int main() {
     Environment<float> env{};
 
     pRRTC_settings settings;
-    settings.num_new_configs = 512;
+    // RSW-2740: 160 not 512. Only 2 blocks/SM x 80 SMs = 160 blocks are ever resident (47781
+    // bytes shared memory per block vs 102400 per SM) and rrtc()'s blocks are persistent, so the
+    // other 352 never searched at all. 160 also fixes the iteration-1 tree split: the
+    // `bid < num_new_configs / 2` threshold was 256 at 512, so every resident block (bids 0-159)
+    // started on tree 0 and the goal tree got no extensions in iteration 1.
+    settings.num_new_configs = 32;
     settings.max_iters = 5000;
+    // RSW-2740: not pRRTC_settings.hh's 1000000 default, which sized six per-solve cudaMalloc'd
+    // arrays at ~72MB total to hold trees measured to hold a few hundred nodes (median 3
+    // iterations). That allocation was ~90% of measured per-solve time.
+    settings.max_samples = 20000;
     settings.granularity = 16;  // must match Fanucm710's BATCH_SIZE (16, from our fkcc_gen configs)
     settings.range = 0.5;
     settings.balance = 2;
@@ -593,6 +602,9 @@ int main() {
     pRRTC::uploadToolSpheres(fine_tool_spheres, approx_tool_spheres);
     pRRTC::uploadRobotOverrides(base_link_fine_spheres, base_link_approx_spheres, frames1_rotation);
     pRRTC::uploadJointLimits(joint_limit_lower, joint_limit_upper);
+    // RSW-2740: solve() no longer uploads d_settings per call (it raced once solves moved
+    // onto per-thread streams). Upload it once here, with the other __constant__ state.
+    pRRTC::uploadSettings(settings);
 
     std::mutex cout_mutex;
 

@@ -604,6 +604,17 @@ int main() {
     pRRTC::uploadToolSpheres(fine_tool_spheres, approx_tool_spheres);
     pRRTC::uploadRobotOverrides(base_link_fine_spheres, base_link_approx_spheres, frames1_rotation);
     pRRTC::uploadJointLimits(joint_limit_lower, joint_limit_upper);
+    // RSW-2740: solve() no longer uploads d_settings per call (it raced once solves moved
+    // onto per-thread streams in pRRTC_benchmark.cu - see uploadSettings()'s own comment in
+    // pRRTC_benchmark.hh). Missing this call is NOT a no-op: without it, d_settings keeps
+    // pRRTC_settings.hh's compile-time default (granularity=64), not this file's own
+    // granularity=16 set above - the kernel launches 4*16=64 threads per block (host-side
+    // settings still drive that), but interpolates edges as vec/64 internally, so only the
+    // first quarter of every accepted edge (tid/4+1 maxes at 16, out of a true 64-step
+    // granularity) was ever actually collision-checked. Caught via a real user-observed
+    // symptom: large jumps between consecutive waypoints and a workpiece collision on a
+    // path this benchmark had reported as solved.
+    pRRTC::uploadSettings(settings);
 
     for (int i = 0; i < kNumRuns; ++i) {
         std::cout << "Starting run " << i << " (max_iters=" << settings.max_iters << ")...\n";
