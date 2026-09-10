@@ -566,7 +566,7 @@ int main() {
     // other 352 never searched at all. 160 also fixes the iteration-1 tree split: the
     // `bid < num_new_configs / 2` threshold was 256 at 512, so every resident block (bids 0-159)
     // started on tree 0 and the goal tree got no extensions in iteration 1.
-    settings.num_new_configs = 32;
+    settings.num_new_configs = 160;
     settings.max_iters = 5000;
     // RSW-2740: not pRRTC_settings.hh's 1000000 default, which sized six per-solve cudaMalloc'd
     // arrays at ~72MB total to hold trees measured to hold a few hundred nodes (median 3
@@ -623,6 +623,9 @@ int main() {
         double cost_before_shortcut = 0.0;
         double cost_after_shortcut = 0.0;
         if (result.solved) {
+            // pRRTC returns goal->start order; reverse to start->goal so this file's
+            // path output matches trajectory_planner/src/prrtc_p2p.cpp's convention.
+            std::reverse(result.path.begin(), result.path.end());
             cost_before_shortcut = path_cost(result.path);
             result.path =
                 pRRTC::shortcutPath<Robot>(result.path, settings.range, settings.granularity, kShortcutMaxAttempts);

@@ -635,6 +635,22 @@ namespace pRRTC
                     // printf("last_interp_cfg: %f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f\n", last_interp_cfg[0], last_interp_cfg[1], last_interp_cfg[2], last_interp_cfg[3], last_interp_cfg[4], last_interp_cfg[5], last_interp_cfg[6], last_interp_cfg[7], last_interp_cfg[8], last_interp_cfg[9], last_interp_cfg[10], last_interp_cfg[11], last_interp_cfg[12], last_interp_cfg[13]);
                     // printf("config added: %f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f\n", config[0], config[1], config[2], config[3], config[4], config[5], config[6], config[7], config[8], config[9], config[10], config[11], config[12], config[13]);
                 }
+                // Publish this node's parent pointer (and radius) DEVICE-WIDE before its
+                // coordinates become visible. The coordinates are what gates selection now: an
+                // unwritten slot reads as the far-away sentinel and loses every nearest-neighbour
+                // comparison, so any block that can see a node's coordinates must already be able
+                // to see its parent. Otherwise the trace-back can follow a stale t_parents entry,
+                // because parents[] is NOT sentinel-cleared (only the roots are initialized).
+                // __syncthreads() alone cannot do this: its memory guarantee is block-scoped, so
+                // it says nothing about what other BLOCKS observe.
+                //
+                // This fence is MOVED, not added: it used to sit after the d_completed_nodes
+                // increment below, where it ordered nothing that still matters (that counter no
+                // longer gates candidate selection now that the sentinel does).
+                if (tid == 0)
+                {
+                    __threadfence();
+                }
                 __syncthreads();
 
                 if (tid < dim)
@@ -644,7 +660,6 @@ namespace pRRTC
                 if (tid == 0)
                 {
                     atomicAdd((int *)&d_completed_nodes[t_tree_id], 1);
-                    __threadfence();
                 }
                 __syncthreads();
 
@@ -815,6 +830,11 @@ namespace pRRTC
                         local_cc_result[0] = 0;
                         // printf("config added (extension): %f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f\n", config[0], config[1], config[2], config[3], config[4], config[5], config[6], config[7], config[8], config[9], config[10], config[11], config[12], config[13]);
                     }
+                    // Same moved fence as the extend path above, for the same reason.
+                    if (tid == 0)
+                    {
+                        __threadfence();
+                    }
                     __syncthreads();
                     if (tid < dim)
                     {
@@ -824,7 +844,6 @@ namespace pRRTC
                     if (tid == 0)
                     {
                         atomicAdd((int *)&d_completed_nodes[t_tree_id], 1);
-                        __threadfence();
                     }
                     __syncthreads();
                     i_extensions++;
@@ -1346,6 +1365,30 @@ namespace pRRTC
         *h_solved = -1;
 
         auto copy_start_time = std::chrono::steady_clock::now();
+
+        // DIAGNOSTIC FIX (jump-collision investigation): restore a per-call "unwritten" sentinel
+        // for both node arrays, as a device-side memset rather than the old host fill + H2D copy
+        // that was removed for being expensive.
+        //
+        // Why it is needed: the removal comment above claims both nearest-neighbour scans are
+        // "strictly bounded by min(d_atomic_free_index[t], d_completed_nodes[t]), so no block can
+        // reach an entry that has not already been written". That does not hold.
+        // d_atomic_free_index is an ALLOCATION high-water mark and d_completed_nodes is a COUNT of
+        // completions incremented in arbitrary order, so neither is a contiguous written prefix:
+        // if blocks claim slots 5 and 6 and the one holding 6 finishes first, a scan bounded by
+        // that min() reads slot 5 while it is still in flight. The scan then picks stale
+        // coordinates as "nearest", validates an edge from THOSE coordinates, and records the new
+        // node parented to that slot, so the emitted parent->child edge is not the edge that was
+        // collision-checked.
+        //
+        // 0x7F bytes give ~3.39e38 per float, so sq_l2_dist() to an unwritten slot overflows to
+        // +inf and the slot can never win a nearest-neighbour reduction. That also makes a
+        // PARTIALLY written slot self-masking (any single sentinel component forces inf), which
+        // covers the separate missing-fence gap where a block's completion increment can be
+        // observed before its own coordinate writes.
+        cudaMemsetAsync((void *)nodes[0], 0x7F, settings.max_samples * config_size, stream);
+        cudaMemsetAsync((void *)nodes[1], 0x7F, settings.max_samples * config_size, stream);
+
         // add start to tree_a and goals to tree_b
         cudaMemcpyAsync((void *)nodes[0], start.data(), config_size, cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync((void *)parents[0], &start_index, sizeof(int), cudaMemcpyHostToDevice, stream);

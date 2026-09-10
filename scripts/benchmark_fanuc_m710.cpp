@@ -570,8 +570,9 @@ int main() {
     Environment<float> env{};
 
     pRRTC_settings settings;
-    settings.num_new_configs = 512;
+    settings.num_new_configs = 160; // measured occupancy limit on this GPU, matches trajectory_planner/src/prrtc_p2p.cpp
     settings.max_iters = 5000;
+    settings.max_samples = 20000; // matches trajectory_planner/src/prrtc_p2p.cpp - default (1000000) oversizes per-solve device buffers
     settings.granularity = 16;  // must match Fanucm710's BATCH_SIZE (16, from our fkcc_gen configs)
     settings.range = 0.5;
     settings.balance = 2;
@@ -625,6 +626,9 @@ int main() {
         double cost_before_shortcut = 0.0;
         double cost_after_shortcut = 0.0;
         if (result.solved) {
+            // pRRTC returns goal->start order; reverse to start->goal so this file's
+            // path output matches trajectory_planner/src/prrtc_p2p.cpp's convention.
+            std::reverse(result.path.begin(), result.path.end());
             cost_before_shortcut = path_cost(result.path);
             result.path =
                 pRRTC::shortcutPath<Robot>(result.path, settings.range, settings.granularity, kShortcutMaxAttempts);
