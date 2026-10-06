@@ -6,7 +6,7 @@ namespace ppln::collision {
 
 
 
-#define FANUCM710_APPROX_SPHERE_COUNT 39
+#define FANUCM710_APPROX_SPHERE_COUNT 44
 #define FANUCM710_APPROX_MAX_TOOL_SPHERES 10
 // Reserved base_link capacity (RSW-2740) - was exactly 4 (Collins's own approx base_link count,
 // with no slack) until pierce_primer's approx-tier base_link needed more for a visually-tuned
@@ -15,7 +15,7 @@ namespace ppln::collision {
 // count/capacity pairing in this file.
 #define FANUCM710_APPROX_MAX_BASE_LINK_SPHERES 16
 #define FANUCM710_APPROX_JOINT_COUNT 8
-#define FANUCM710_APPROX_SELF_CC_RANGE_COUNT 28
+#define FANUCM710_APPROX_SELF_CC_RANGE_COUNT 33
 #define FIXED -1
 #define X_PRISM 0
 #define Y_PRISM 1
@@ -45,7 +45,7 @@ __device__ __forceinline__ bool fanucm710_wrist_pair_excluded(int joint_a, int j
     return lo == 6 && hi == 7;
 }
 
-__device__ __constant__ float4 fanucm710_approx_spheres_array[39] = {
+__device__ __constant__ float4 fanucm710_approx_spheres_array[44] = {
     // Reserves FANUCM710_APPROX_MAX_BASE_LINK_SPHERES (16) slots for the current test case's
     // approx-tier base_link geometry (RSW-2740) - unlike link_1 onward below (frame-invariant,
     // baked in once), base_link's centers are case-specific (see uploadRobotOverrides()'s own
@@ -69,19 +69,30 @@ __device__ __constant__ float4 fanucm710_approx_spheres_array[39] = {
     { 1e6f, 1e6f, 1e6f, 0.0f },
     { 1e6f, 1e6f, 1e6f, 0.0f },
     { 1e6f, 1e6f, 1e6f, 0.0f },
-    { 0.07f, 0.128f, -0.049f, 0.3117f },
-    { 0.023f, -0.136f, -0.049f, 0.28573f },
+    // link_1 (joint 2), baked from cricket's generated table
+    { 0.023f, 0.01715f, -0.04473f, 0.439f },
+    // link_2 (joint 3), baked from cricket's generated table
     { 0.007f, -0.528f, 0.183f, 0.1628f },
-    { -0.011f, -0.778f, 0.179f, 0.16798f },
+    { -0.011f, -0.75112f, 0.179f, 0.16798f },
     { 0.007f, -1.006f, 0.179f, 0.14822f },
     { -0.0057f, -0.276f, 0.142f, 0.1921f },
+    { -0.034f, -1.21175f, 0.18359f, 0.143f },
+    { -0.00095f, -0.60952f, 0.35718f, 0.216f },
+    { 0.01393f, -0.08645f, 0.122f, 0.222f },
+    // link_3 (joint 4), baked from cricket's generated table
     { 0.049f, -0.017f, 0.019f, 0.32657f },
+    { 0.41537f, 0.46642f, -0.11798f, 0.365f },
+    { 0.52261f, -0.11364f, -0.09717f, 0.537f },
+    // link_4 (joint 5), baked from cricket's generated table
     { 0.0f, 0.0f, -0.627f, 0.14706f },
     { 0.0f, 0.001f, -1.109f, 0.12745f },
-    { 0.0f, 0.0f, -0.37f, 0.14706f },
-    { 0.002f, -0.003f, -0.872f, 0.14278f },
-    { -0.003f, -0.017f, 0.006f, 0.128f },
-    { 0.006f, 0.007f, 0.065f, 0.0973f },
+    { 0.0f, 0.0f, -0.4183f, 0.19f },
+    { 0.002f, -0.003f, -0.90349f, 0.193f },
+    { 0.00411f, 0.05058f, -1.272f, 0.133f },
+    // link_5 (joint 6), baked from cricket's generated table
+    { -0.003f, -0.03556f, -0.01739f, 0.136f },
+    // link_6 (joint 7), baked from cricket's generated table
+    { 0.006f, -0.00728f, -0.01083f, 0.076f },
     // Reserves FANUCM710_APPROX_MAX_TOOL_SPHERES (10) slots for whatever tool the current test
     // case mounts (RSW-2740) - populated at runtime by uploadToolSpheres(), same reasoning and
     // inert-placeholder convention as fanucm710_spheres_array's tool reservation above.
@@ -149,7 +160,7 @@ __device__ __constant__ float fanucm710_approx_fixed_transforms[] = {
     
 };
 
-__device__ __constant__ int fanucm710_approx_sphere_to_joint[39] = {
+__device__ __constant__ int fanucm710_approx_sphere_to_joint[44] = {
     1,
     1,
     1,
@@ -167,12 +178,17 @@ __device__ __constant__ int fanucm710_approx_sphere_to_joint[39] = {
     1,
     1,
     2,
-    2,
+    3,
+    3,
+    3,
     3,
     3,
     3,
     3,
     4,
+    4,
+    4,
+    5,
     5,
     5,
     5,
@@ -191,7 +207,7 @@ __device__ __constant__ int fanucm710_approx_sphere_to_joint[39] = {
     7
 };
 
-__device__ __constant__ int fanucm710_approx_flattened_joint_to_spheres[47] = {
+__device__ __constant__ int fanucm710_approx_flattened_joint_to_spheres[52] = {
     -1,
     0,
     1,
@@ -211,33 +227,38 @@ __device__ __constant__ int fanucm710_approx_flattened_joint_to_spheres[47] = {
     15,
     -1,
     16,
-    17,
     -1,
+    17,
     18,
     19,
     20,
     21,
-    -1,
     22,
-    -1,
     23,
+    -1,
     24,
     25,
     26,
     -1,
     27,
-    -1,
     28,
     29,
     30,
     31,
+    -1,
     32,
+    -1,
     33,
     34,
     35,
     36,
     37,
     38,
+    39,
+    40,
+    41,
+    42,
+    43,
     -1
 };
 
@@ -252,35 +273,40 @@ __device__ __constant__ int fanucm710_approx_joint_types[] = {
     5
 };
 
-__device__ __constant__ int fanucm710_approx_self_cc_ranges[28][3] = {
-    { 0, 18, 38 },
-    { 1, 18, 38 },
-    { 2, 18, 38 },
-    { 3, 18, 38 },
-    { 4, 18, 38 },
-    { 5, 18, 38 },
-    { 6, 18, 38 },
-    { 7, 18, 38 },
-    { 8, 18, 38 },
-    { 9, 18, 38 },
-    { 10, 18, 38 },
-    { 11, 18, 38 },
-    { 12, 18, 38 },
-    { 13, 18, 38 },
-    { 14, 18, 38 },
-    { 15, 18, 38 },
-    { 16, 22, 38 },
-    { 17, 22, 38 },
-    { 18, 23, 38 },
-    { 19, 23, 38 },
-    { 20, 23, 38 },
-    { 21, 23, 38 },
-    { 22, 29, 38 },
-    { 23, 28, 38 },
-    { 24, 28, 38 },
-    { 25, 28, 38 },
-    { 26, 28, 38 },
-    { 27, 29, 38 }
+__device__ __constant__ int fanucm710_approx_self_cc_ranges[33][3] = {
+    { 0, 17, 43 },
+    { 1, 17, 43 },
+    { 2, 17, 43 },
+    { 3, 17, 43 },
+    { 4, 17, 43 },
+    { 5, 17, 43 },
+    { 6, 17, 43 },
+    { 7, 17, 43 },
+    { 8, 17, 43 },
+    { 9, 17, 43 },
+    { 10, 17, 43 },
+    { 11, 17, 43 },
+    { 12, 17, 43 },
+    { 13, 17, 43 },
+    { 14, 17, 43 },
+    { 15, 17, 43 },
+    { 16, 24, 43 },
+    { 17, 27, 43 },
+    { 18, 27, 43 },
+    { 19, 27, 43 },
+    { 20, 27, 43 },
+    { 21, 27, 43 },
+    { 22, 27, 43 },
+    { 23, 27, 43 },
+    { 24, 34, 43 },
+    { 25, 34, 43 },
+    { 26, 34, 43 },
+    { 27, 33, 43 },
+    { 28, 33, 43 },
+    { 29, 33, 43 },
+    { 30, 33, 43 },
+    { 31, 33, 43 },
+    { 32, 34, 43 }
 };
 
 __device__ __constant__ int fanucm710_approx_joint_parents[8] = {
@@ -536,10 +562,10 @@ __device__ bool fanucm710_env_collision_check_approx_sdf(
 
 
 
-#define FANUCM710_SPHERE_COUNT 148
+#define FANUCM710_SPHERE_COUNT 162
 #define FANUCM710_MAX_TOOL_SPHERES 80
 #define FANUCM710_JOINT_COUNT 8
-#define FANUCM710_SELF_CC_RANGE_COUNT 63
+#define FANUCM710_SELF_CC_RANGE_COUNT 77
 #define FIXED -1
 #define X_PRISM 0
 #define Y_PRISM 1
@@ -549,7 +575,7 @@ __device__ bool fanucm710_env_collision_check_approx_sdf(
 #define Z_ROT 5
 #define BATCH_SIZE 16
 
-__device__ __constant__ float4 fanucm710_spheres_array[148] = {
+__device__ __constant__ float4 fanucm710_spheres_array[162] = {
     { 0.279f, 0.653f, 0.188f, 0.23272f },
     { -0.132f, 0.972f, 0.158f, 0.20229f },
     { -0.104f, 0.213f, 0.157f, 0.20229f },
@@ -574,10 +600,12 @@ __device__ __constant__ float4 fanucm710_spheres_array[148] = {
     { 0.376f, 0.522f, 0.156f, 0.2199f },
     { 0.084f, 0.45f, 0.177f, 0.2f },
     { -0.174f, 0.357f, 0.177f, 0.2f },
+    // link_1 (joint 2), baked from cricket's generated table
     { 0.026f, 0.128f, -0.049f, 0.265f },
     { -0.053f, -0.136f, -0.049f, 0.265f },
     { 0.142f, -0.065f, -0.042f, 0.258f },
     { -0.141f, 0.056f, -0.046f, 0.262f },
+    // link_2 (joint 3), baked from cricket's generated table
     { 0.0f, -0.571f, 0.362f, 0.105f },
     { 0.0f, -0.721f, 0.362f, 0.07f },
     { 0.0f, -0.471f, 0.362f, 0.07f },
@@ -592,13 +620,29 @@ __device__ __constant__ float4 fanucm710_spheres_array[148] = {
     { -0.034f, -0.009f, 0.122f, 0.133f },
     { 0.053f, -0.025f, 0.14f, 0.13f },
     { 0.002f, -1.199f, 0.184f, 0.099f },
+    // link_3 (joint 4), baked from cricket's generated table
+    { 0.408f, 0.178f, -0.315f, 0.13f },
+    { 0.366f, 0.35f, -0.001f, 0.183f },
     { 0.143f, 0.019f, -0.019f, 0.182f },
+    { 0.368f, 0.404f, -0.288f, 0.18f },
+    { 0.364f, 0.51f, 0.042f, 0.18f },
+    { 0.357f, 0.531f, -0.294f, 0.174f },
+    { 0.423f, -0.259f, 0.077f, 0.13f },
     { 0.01f, 0.125f, 0.101f, 0.139f },
+    { 0.423f, -0.459f, 0.072f, 0.13f },
+    { 0.429f, -0.019f, 0.104f, 0.119f },
+    { 0.428f, 0.158f, -0.135f, 0.12f },
     { -0.002f, -0.05f, 0.153f, 0.128f },
     { 0.009f, -0.116f, -0.078f, 0.123f },
+    { 0.429f, 0.152f, 0.092f, 0.119f },
     { 0.01f, 0.095f, -0.061f, 0.14f },
+    { 0.358f, 0.533f, -0.155f, 0.175f },
+    { 0.377f, -0.025f, -0.3f, 0.102f },
+    { 0.378f, -0.332f, -0.3f, 0.101f },
     { 0.17f, -0.162f, 0.029f, 0.11f },
     { 0.159f, 0.075f, 0.183f, 0.109f },
+    { 0.379f, -0.153f, -0.299f, 0.1f },
+    // link_4 (joint 5), baked from cricket's generated table
     { 0.0f, 0.0f, -0.693f, 0.103f },
     { 0.0f, 0.001f, -1.109f, 0.103f },
     { 0.0f, 0.0f, -0.441f, 0.103f },
@@ -609,10 +653,12 @@ __device__ __constant__ float4 fanucm710_spheres_array[148] = {
     { -0.001f, 0.001f, -0.834f, 0.102f },
     { 0.0f, 0.003f, -1.245f, 0.076f },
     { -0.011f, 0.069f, -1.337f, 0.064f },
+    // link_5 (joint 6), baked from cricket's generated table
     { -0.003f, -0.093f, 0.001f, 0.076f },
     { 0.0f, 0.03f, 0.007f, 0.07f },
     { -0.001f, 0.004f, -0.069f, 0.07f },
     { -0.001f, -0.06f, -0.062f, 0.07f },
+    // link_6 (joint 7), baked from cricket's generated table
     { -0.017f, -0.05f, 0.011f, 0.024f },
     { -0.045f, -0.003f, 0.011f, 0.024f },
     { 0.032f, -0.022f, 0.01f, 0.024f },
@@ -760,7 +806,7 @@ __device__ __constant__ float fanucm710_fixed_transforms[] = {
     
 };
 
-__device__ __constant__ int fanucm710_sphere_to_joint[148] = {
+__device__ __constant__ int fanucm710_sphere_to_joint[162] = {
     1,
     1,
     1,
@@ -803,6 +849,20 @@ __device__ __constant__ int fanucm710_sphere_to_joint[148] = {
     3,
     3,
     3,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
     4,
     4,
     4,
@@ -911,7 +971,7 @@ __device__ __constant__ int fanucm710_sphere_to_joint[148] = {
     7
 };
 
-__device__ __constant__ int fanucm710_flattened_joint_to_spheres[156] = {
+__device__ __constant__ int fanucm710_flattened_joint_to_spheres[170] = {
     -1,
     0,
     1,
@@ -965,7 +1025,6 @@ __device__ __constant__ int fanucm710_flattened_joint_to_spheres[156] = {
     46,
     47,
     48,
-    -1,
     49,
     50,
     51,
@@ -976,7 +1035,6 @@ __device__ __constant__ int fanucm710_flattened_joint_to_spheres[156] = {
     56,
     57,
     58,
-    -1,
     59,
     60,
     61,
@@ -992,10 +1050,12 @@ __device__ __constant__ int fanucm710_flattened_joint_to_spheres[156] = {
     70,
     71,
     72,
+    -1,
     73,
     74,
     75,
     76,
+    -1,
     77,
     78,
     79,
@@ -1067,6 +1127,20 @@ __device__ __constant__ int fanucm710_flattened_joint_to_spheres[156] = {
     145,
     146,
     147,
+    148,
+    149,
+    150,
+    151,
+    152,
+    153,
+    154,
+    155,
+    156,
+    157,
+    158,
+    159,
+    160,
+    161,
     -1
 };
 
@@ -1081,70 +1155,84 @@ __device__ __constant__ int fanucm710_joint_types[] = {
     5
 };
 
-__device__ __constant__ int fanucm710_self_cc_ranges[63][3] = {
-    { 0, 28, 147 },
-    { 1, 28, 147 },
-    { 2, 28, 147 },
-    { 3, 28, 147 },
-    { 4, 28, 147 },
-    { 5, 28, 147 },
-    { 6, 28, 147 },
-    { 7, 28, 147 },
-    { 8, 28, 147 },
-    { 9, 28, 147 },
-    { 10, 28, 147 },
-    { 11, 28, 147 },
-    { 12, 28, 147 },
-    { 13, 28, 147 },
-    { 14, 28, 147 },
-    { 15, 28, 147 },
-    { 16, 28, 147 },
-    { 17, 28, 147 },
-    { 18, 28, 147 },
-    { 19, 28, 147 },
-    { 20, 28, 147 },
-    { 21, 28, 147 },
-    { 22, 28, 147 },
-    { 23, 28, 147 },
-    { 24, 42, 147 },
-    { 25, 42, 147 },
-    { 26, 42, 147 },
-    { 27, 42, 147 },
-    { 28, 49, 147 },
-    { 29, 49, 147 },
-    { 30, 49, 147 },
-    { 31, 49, 147 },
-    { 32, 49, 147 },
-    { 33, 49, 147 },
-    { 34, 49, 147 },
-    { 35, 49, 147 },
-    { 36, 49, 147 },
-    { 37, 49, 147 },
-    { 38, 49, 147 },
-    { 39, 49, 147 },
-    { 40, 49, 147 },
-    { 41, 49, 147 },
-    { 42, 68, 147 },
-    { 43, 68, 147 },
-    { 44, 68, 147 },
-    { 45, 68, 147 },
-    { 46, 68, 147 },
-    { 47, 68, 147 },
-    { 48, 68, 147 },
-    { 49, 63, 147 },
-    { 50, 63, 147 },
-    { 51, 63, 147 },
-    { 52, 63, 147 },
-    { 53, 63, 147 },
-    { 54, 63, 147 },
-    { 55, 63, 147 },
-    { 56, 63, 147 },
-    { 57, 63, 147 },
-    { 58, 63, 147 },
-    { 59, 68, 147 },
-    { 60, 68, 147 },
-    { 61, 68, 147 },
-    { 62, 68, 147 }
+__device__ __constant__ int fanucm710_self_cc_ranges[77][3] = {
+    { 0, 28, 161 },
+    { 1, 28, 161 },
+    { 2, 28, 161 },
+    { 3, 28, 161 },
+    { 4, 28, 161 },
+    { 5, 28, 161 },
+    { 6, 28, 161 },
+    { 7, 28, 161 },
+    { 8, 28, 161 },
+    { 9, 28, 161 },
+    { 10, 28, 161 },
+    { 11, 28, 161 },
+    { 12, 28, 161 },
+    { 13, 28, 161 },
+    { 14, 28, 161 },
+    { 15, 28, 161 },
+    { 16, 28, 161 },
+    { 17, 28, 161 },
+    { 18, 28, 161 },
+    { 19, 28, 161 },
+    { 20, 28, 161 },
+    { 21, 28, 161 },
+    { 22, 28, 161 },
+    { 23, 28, 161 },
+    { 24, 42, 161 },
+    { 25, 42, 161 },
+    { 26, 42, 161 },
+    { 27, 42, 161 },
+    { 28, 63, 161 },
+    { 29, 63, 161 },
+    { 30, 63, 161 },
+    { 31, 63, 161 },
+    { 32, 63, 161 },
+    { 33, 63, 161 },
+    { 34, 63, 161 },
+    { 35, 63, 161 },
+    { 36, 63, 161 },
+    { 37, 63, 161 },
+    { 38, 63, 161 },
+    { 39, 63, 161 },
+    { 40, 63, 161 },
+    { 41, 63, 161 },
+    { 42, 82, 161 },
+    { 43, 82, 161 },
+    { 44, 82, 161 },
+    { 45, 82, 161 },
+    { 46, 82, 161 },
+    { 47, 82, 161 },
+    { 48, 82, 161 },
+    { 49, 82, 161 },
+    { 50, 82, 161 },
+    { 51, 82, 161 },
+    { 52, 82, 161 },
+    { 53, 82, 161 },
+    { 54, 82, 161 },
+    { 55, 82, 161 },
+    { 56, 82, 161 },
+    { 57, 82, 161 },
+    { 58, 82, 161 },
+    { 59, 82, 161 },
+    { 60, 82, 161 },
+    { 61, 82, 161 },
+    { 62, 82, 161 },
+    { 63, 77, 161 },
+    { 64, 77, 161 },
+    { 65, 77, 161 },
+    { 66, 77, 161 },
+    { 67, 77, 161 },
+    { 68, 77, 161 },
+    { 69, 77, 161 },
+    { 70, 77, 161 },
+    { 71, 77, 161 },
+    { 72, 77, 161 },
+    { 73, 82, 161 },
+    { 74, 82, 161 },
+    { 75, 82, 161 },
+    { 76, 82, 161 }
 };
 
 __device__ __constant__ int fanucm710_joint_parents[8] = {
